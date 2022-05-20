@@ -1,12 +1,13 @@
 from datetime import datetime, timedelta
 import json
+import logging
 from pathlib import Path
 from pprint import pprint
 from shutil import copy2
+from threading import Thread
 from typing import Dict, Tuple
 from zoneinfo import ZoneInfo
 import requests
-import asyncio
 
 API_KEY = "KaK7CFasJCLAoSCsHtZjvEoC7LZwAvqi"
 FOLDER_ID = "pfkxq-prxga"
@@ -22,14 +23,14 @@ FILE_VERSIONS = REMOTE_FOLDER.joinpath(".fileversions")
 #     except:
 #         return r.text
 
-async def get(req, params={}):
+def get(req, params={}):
     r = requests.get(f"http://localhost:8384/rest/{req}", params=params, headers={"X-API-Key": API_KEY})
     try:
         return r.json()
     except:
         return r.text
 
-async def post(req, data, params={}):
+def post(req, data, params={}):
     # print(req, data, params)
     r = requests.post(f"http://localhost:8384/rest/{req}", json=data, params=params, headers={"X-API-Key": API_KEY})
     # print(r.text)
@@ -38,35 +39,39 @@ async def post(req, data, params={}):
     except:
         return r.text
 
-async def write_json(obj, path):
+def write_json(obj, path):
     with open(path, "w") as f:
         json.dump(obj, f)
 
     print(f"JSON written to {path}")
 
-async def read_json(path):
+def read_json(path):
     with open(path) as f:
         return json.load(f)
 
-async def get_change(last_event=0, timeout=60):
-    return await get("events", {"events": "RemoteChangeDetected,ItemFinished", "since": last_event, "timeout": timeout})
+def get_change(last_event=0, timeout=60):
+    return get("events", {"events": "RemoteChangeDetected,ItemFinished", "since": last_event, "timeout": timeout})
 
 
-async def get_ignores():
-    return (await get("db/ignores", {"folder": FOLDER_ID}))["ignore"]
+def get_ignores():
+    return get("db/ignores", {"folder": FOLDER_ID})["ignore"]
 
-async def update_ignores(ignores):
+def update_ignores(ignores):
     # print(f"Ignores: {ignores}")
-    res = await post("db/ignores", {"ignore": list(ignores)}, {"folder": FOLDER_ID})
-    print(f"Ignores updated: {res}")
+    res = post("db/ignores", {"ignore": list(ignores)}, {"folder": FOLDER_ID})
+    print(res)
+    if len(res) == len(ignores):
+        logging.info("A nem szinkronizálandó fájlok adatbázisának frissítése megtörtént (összesen %d fájl).", len(res))
+    else:
+        logging.error("A nem szinkronizálandó fájlok adatbázisának frissítése sikertelen. Válasz: %s", res)
     return res
 
 
 with open(FILE_VERSIONS) as f:
     latest_versions = json.load(f)
 
-async def main():
-    ignores = set(await get_ignores())
+def main():
+    ignores = set(get_ignores())
 
     if ignores is None:
         ignores = set()
@@ -74,12 +79,10 @@ async def main():
 
     print(f"{ignores=}")
 
-    print(await get("db/browse", {"folder": FOLDER_ID}))
-
-    loop = asyncio.get_event_loop()
+    print(get("db/browse", {"folder": FOLDER_ID}))
 
     while True:
-        changes = await get_change(last_event)
+        changes = get_change(last_event)
         if changes:
             print(changes)
             last_event = max(c["id"] for c in changes)
@@ -95,19 +98,18 @@ async def main():
                     latest_versions[c["data"]["item"]] = {"time": stat.st_mtime_ns, "size": stat.st_size}
                     ignores.add("/" + c["data"]["item"])
                     ignores_changed = True
-                    loop.create_task(write_json(latest_versions, FILE_VERSIONS))
+                    write_json(latest_versions, FILE_VERSIONS)
 
             if ignores_changed:
-                loop.create_task(update_ignores(ignores))
+                Thread(target=update_ignores, args=[ignores])
 
-        await asyncio.sleep(1)
 
 def is_same(date1, size1, date2, size2):
     return abs(date1 - date2) < timedelta(microseconds=10) and size1 == size2
 
-async def archive():
-    archived_versions = await read_json(FILE_VERSIONS)
-    global_versions = await get("db/browse", {"folder": FOLDER_ID})
+def archive():
+    archived_versions = read_json(FILE_VERSIONS)
+    global_versions = get("db/browse", {"folder": FOLDER_ID})
     local_versions = []
 
     # print(global_versions)
@@ -156,13 +158,13 @@ async def archive():
         archived_versions[file] = {"time": glt.isoformat(), "size": gls}
         
 
-    await write_json(archived_versions, FILE_VERSIONS)
+    write_json(archived_versions, FILE_VERSIONS)
 
-    ignores = await get_ignores()
+    ignores = get_ignores()
 
     ignores.extend(map(lambda x: f"/{x}", to_archive))
 
-    await update_ignores(ignores)
+    update_ignores(ignores)
 
     # Wait for syncthing to be idle
 
@@ -177,4 +179,4 @@ async def archive():
 
 # rclone copy Képek onedrive-kifu:Képek --exclude /.st**
 
-asyncio.run(archive())
+archive()
