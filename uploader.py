@@ -21,8 +21,8 @@ class Uploader:
 
         logging.debug("Feltöltésért felelős osztály inicializálva.")
 
-    def get_command(self, path_to_list_of_files):
-        return ["rclone", "copy", "--files-from", path_to_list_of_files, self.local_folder, self.remote_folder]
+    def get_command(self, command, path_to_list_of_files):
+        return ["rclone", command, "--files-from", path_to_list_of_files, self.local_folder, self.remote_folder]
 
     def run_upload(self):
         logging.debug("Új feltöltés kezdeményezve. Várakozás az előző befejeztére...")
@@ -36,17 +36,38 @@ class Uploader:
             self.upload_list_lock.release()
 
             f.write(files_str)
-            res = subprocess.run(self.get_command(), capture_output=True)
+            res = subprocess.run(self.get_command("copy", f.name), capture_output=True)
 
             if res.returncode != 0:
                 logging.error("Fájlok feltöltése sikertelen volt.")
-                data_logger.log(stdout=res.stdout,
-                                stderr=res.stderr, files=files_str)
+                data_logger.log(stdout=res.stdout, stderr=res.stderr, files=files_str)
             else:
                 logging.info("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
                              files_str.count("\n") + 1,
                              files_str[:files_str.find("\n")],
                              files_str[files_str.rfind("\n"):])
+                with open(self.upload_list_file, "a+") as f:
+                    f.write(files_str)
+                    f.write("\n")
+
+        self.upload_lock.release()
+
+    def run_move(self, files):
+        logging.debug("Áthelyezés kezdeményezve a felhőtárhelyre. Várakozás...")
+        self.upload_lock.acquire()
+
+        with NamedTemporaryFile("w", suffix=".txt") as f:
+            files_str = "\n".join(files)
+            f.write(files_str)
+
+            res = subprocess.run(self.get_command("move", f.name), capture_output=True)
+
+            if res.returncode != 0:
+                logging.error("Fájlok áthelyezése a felhőtárhelyre sikertelen.")
+                data_logger.log(stdout=res.stdout, stderr=res.stderr, files=files_str)
+            else:
+                logging.info("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
+                             len(files), files[0], files[-1])
                 with open(self.upload_list_file, "a+") as f:
                     f.write(files_str)
                     f.write("\n")

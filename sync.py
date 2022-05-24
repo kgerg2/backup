@@ -9,12 +9,18 @@ from typing import Dict, Tuple
 from zoneinfo import ZoneInfo
 import requests
 
+from uploader import Uploader
+
 API_KEY = "KaK7CFasJCLAoSCsHtZjvEoC7LZwAvqi"
 FOLDER_ID = "pfkxq-prxga"
 FOLDER = Path("~/bmt").expanduser()
 IGNORE_FILE = FOLDER.joinpath(".stignore")
-REMOTE_FOLDER = Path("~/bmt-tavoli").expanduser()
-FILE_VERSIONS = REMOTE_FOLDER.joinpath(".fileversions")
+BACKUP_FOLDER = Path("~/bmt-tavoli").expanduser()
+REMOTE_FOLDER = Path("onedrive-kifu:bmt")
+
+METADATA_FOLDER = FOLDER.joinpath(".backupdata")
+BACKUP_FILE_LIST = METADATA_FOLDER.joinpath("backup-files.txt")
+REMOTE_FILE_LIST = METADATA_FOLDER.joinpath("onedrive-files.txt")
 
 # def make_request(type, req, params)
 #     r = type(f"http://localhost:8384/rest/{req}", params=params, headers={"X-API-Key": API_KEY})
@@ -71,6 +77,7 @@ with open(FILE_VERSIONS) as f:
     latest_versions = json.load(f)
 
 def main():
+    onedrive_uploader = Uploader(FOLDER, REMOTE_FOLDER, REMOTE_FILE_LIST)
     ignores = set(get_ignores())
 
     if ignores is None:
@@ -108,6 +115,7 @@ def is_same(date1, size1, date2, size2):
     return abs(date1 - date2) < timedelta(microseconds=10) and size1 == size2
 
 def archive():
+    onedrive_uploader = Uploader(FOLDER, REMOTE_FOLDER, REMOTE_FILE_LIST)
     archived_versions = read_json(FILE_VERSIONS)
     global_versions = get("db/browse", {"folder": FOLDER_ID})
     local_versions = []
@@ -152,13 +160,13 @@ def archive():
                   if f in global_files and (f not in archived_files or not is_same(*data, *archived_files[f]))]
 
     for file in to_archive:
-        copy2(FOLDER.joinpath(file), REMOTE_FOLDER.joinpath(file))
+        copy2(FOLDER.joinpath(file), BACKUP_FOLDER.joinpath(file))
 
         glt, gls = global_files[file]
         archived_versions[file] = {"time": glt.isoformat(), "size": gls}
         
 
-    write_json(archived_versions, FILE_VERSIONS)
+    write_json(archived_versions, BACKUP_FILE_LIST)
 
     ignores = get_ignores()
 
@@ -166,16 +174,19 @@ def archive():
 
     update_ignores(ignores)
 
-    # Wait for syncthing to be idle
+    onedrive_uploader.run_move(list(local_files.keys() & global_files.keys()))
 
-    for file in to_archive:
-        if file.is_file():
-            file.unlink()
+    # A többi lokális fájl törölhető?
 
-        if file.is_dir():
-            file.unlink()
+
+    # for file in to_archive:
+    #     if file.is_file():
+    #         file.unlink()
+
+    #     if file.is_dir():
+    #         file.unlink()
     
-        print(f"Unexpected thing: {file} not file and not dir. Might have been deleted.")
+    #     print(f"Unexpected thing: {file} not file and not dir. Might have been deleted.")
 
 # rclone copy Képek onedrive-kifu:Képek --exclude /.st**
 
