@@ -190,4 +190,3 @@ def archive():
 
 # rclone copy Képek onedrive-kifu:Képek --exclude /.st**
 
-archive()

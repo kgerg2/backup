@@ -2,7 +2,7 @@ from datetime import datetime, time, timedelta
 import logging
 from operator import itemgetter
 from queue import Queue
-from threading import Thread
+from multiprocessing import Process
 from time import sleep
 from typing import Callable, List, Optional, Union
 from dateutil import relativedelta, rrule, utils, tz
@@ -35,12 +35,12 @@ class TimedTask:
         self.enabled = enabled
 
     #     self.next_time = None
-    #     self.thread = None
+    #     self.process = None
     #     self.retry_count = 0
 
     # def reset_variables(self):
     #     self.next_time = None
-    #     self.thread = None
+    #     self.process = None
     #     self.retry_count = 0
         
     def get_next_scheduled(self):
@@ -71,11 +71,16 @@ def start_main_loop() -> bool:
 
     for task in TASKS:
         task.next_time = task.get_next_scheduled()
-        task.thread = None
+        task.process = None
         task.retry_count = 0
 
     while True:
         task = min(TASKS, lambda x: x.next_time)
+
+        if task.process is not None and task.process.exitcode:
+            task.retry_count += 1
+        else:
+            task.retry_count = 0
 
         if task.retry_count > task.max_retry_count:
             logging.error(f"A(z) {task.name} feladat futtatása során az újrapróbálkozások száma "
@@ -97,7 +102,7 @@ def start_main_loop() -> bool:
             task.retry_count += 1
             continue
 
-        if task.thread is not None and task.thread.is_alive():
+        if task.process is not None and task.process.is_alive():
             task.next_time = task.get_next_retry(task.next_time)
             logging.info(f"A(z) {task.name} feladat előző futtatása még nem fejeződött be, "
                          f"ezért most nem indult el újra. Következő újrapróbálás ideje: "
@@ -107,8 +112,8 @@ def start_main_loop() -> bool:
             
 
         try:
-            task.thread = Thread(target=task.task)
-            task.thread.start()
+            task.process = Process(target=task.task)
+            task.process.start()
         except SystemExit as e:
             logging.warning(f"A futtatott feladat ({task.name}) kilépést kért a programból: {e}")
             return False
@@ -118,7 +123,6 @@ def start_main_loop() -> bool:
             raise
         else:
             task.next_time = task.get_next_scheduled()
-            task.retry_count = 0
 
 
 

@@ -4,14 +4,15 @@ import logging
 from pathlib import Path
 from shutil import copy2
 import subprocess
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from zoneinfo import ZoneInfo
 
-from util import get_file_info, write_checkfile
+import data_logger
+from util import extend_ignores, get_file_info, write_checkfile
 
 
 LOCAL_FOLDER = Path("~/bmt").expanduser()
-
+REMOTE_FOLDER = Path("onedrive-kifu:bmt")
 ARCHIVE_FOLDER = Path("/mnt/...")
 
 IGNORE_FILE = Path("~/bmt/")
@@ -24,6 +25,8 @@ ARCHIVED_FILES = Path("~/bmt/")
 KEEP_AGE = timedelta(days=60)
 
 CONFIG_DATA = Path("~/bmt/...")
+
+TRASH_FOLDER = Path("~/bmt/")
 # ARCHIVED_LIST = ARCHIVE_FOLDER.joinpath("")
 
 
@@ -67,6 +70,8 @@ def reconnect(drive):
 
 
 def archive(freeup_needed=0):
+    logging.info("Archválás...")
+    
     with open(CONFIG_DATA) as f:
         config = json.load(f)
 
@@ -86,16 +91,23 @@ def archive(freeup_needed=0):
 
     with TemporaryDirectory() as tempdir:
         dir_path = Path(tempdir)
+
         checkfile = dir_path.joinpath("checkfile.txt")
         write_checkfile(checkfile, global_files)
+
         differing_files_path = dir_path.joinpath("differ.txt")
         not_archived_files_path = dir_path.joinpath("sync.txt")
         deleted_files_path = dir_path.joinpath("deleted.txt")
+
         r = subprocess.run(["rclone", "check", str(checkfile), ARCHIVE_FOLDER,
                             "--checkcfile", "QuickXorHash",
                             "--differ", str(differing_files_path),
                             "--missing-on-dst", str(not_archived_files_path),
                             "--missing-on-src", str(deleted_files_path)], capture_output=True)
+
+        if r.returncode:
+            logging.error("Az archiválandó fájlok meghatározása nem sikerült, az összehasonlítás meghiúsult."
+                          " (hibakód: %d, '%s', '%s')", r.returncode, r.stdout, r.stderr)
 
         with open(differing_files_path) as f:
             copy_to_archive = f.read().splitlines()
@@ -106,13 +118,7 @@ def archive(freeup_needed=0):
         with open(deleted_files_path) as f:
             delete_from_archive = f.read().splitlines()
 
-    synced_files = get_file_info(SYNCED_FILES)
-
-    archived_files = get_files(ARCHIVE_FOLDER, ignore_patterns)
     local_files = get_files(LOCAL_FOLDER, ignore_patterns)
-
-    # files_to_delete = []
-    # files_to_copy = []
 
     delete_from_local = []
 
@@ -133,38 +139,41 @@ def archive(freeup_needed=0):
             logging.warning("Nem lehetséges elegendő tárhely felszabadítása. Kért mennyiség: %d, "
                             "teljesíthető: %d", freeup_needed, freed_up_space)
 
-    #     if file not in archived_files or not is_same_file(data, archived_files[file]):
-    #         files_to_copy.append(file)
+    with NamedTemporaryFile() as f:
+        f.write("\n".join(copy_to_archive))
+        subprocess.run(["rclone", "copy", "--files-from", f.name,
+                       str(LOCAL_FOLDER), str(ARCHIVE_FOLDER)])
+    with TemporaryDirectory() as tempdir:
+        dir_path = Path(tempdir)
+        missing = dir_path.joinpath("missing.txt")
+        r = subprocess.run(["rclone", "check", str(LOCAL_FOLDER), str(
+            REMOTE_FOLDER), "--missing-on-dst", missing], capture_output=True)
 
-    #     if datetime.now() - date > KEEP_AGE and file in synced_files and is_same_file(data, synced_files[file]):
-    #         files_to_delete.append(file)
-    #         freed_up_space += size
+        if r.returncode:
+            logging.error("A lokális fájlok szinkronizáltságának ellenőrzése sikertelen. "
+                          "Fájlok törlése kihagyára kerül. (hibakód: %d, '%s', '%s')", r.returncode, r.stdout, r.stderr)
 
-    # if freeup_needed > freed_up_space:
-    #     largest_files = sorted((file for file in local_files.keys() & synced_files.keys() - files_to_delete),
-    #                            key=lambda x: local_files[x][1], reverse=True)
+        with open(missing) as f:
+            files = f.read()
 
-    #     for file in largest_files:
-    #         files_to_delete.append(file)
-    #         freed_up_space += local_files[file][1]
-    #         if freed_up_space >= freeup_needed:
-    #             break
+            if files:
+                logging.warning("Néhány fájl még nem került szinkronizálásra. Ezek törlése nem fog megtörténni.")
+                data_logger.log(files)
 
-    # for file in copy_to_archive:
-    #     try:
-    #         copy2(LOCAL_FOLDER.joinpath(file), ARCHIVE_FOLDER.joinpath(file))
-    #     except Exception as e:
-    #         logging.error(f"Sikertelen másolás ({file}): {e}")
-    #         try:
-    #             files_to_delete.remove(file)
-    #         except ValueError:
-    #             pass
-    #         else:
-    #             logging.warning(f"A másolás miatt a fájl ({file}) nem fog törlésre kerülni.")
-    #         continue
+                delete_from_local = list(set(delete_from_local) - set(files.splitlines()))
 
-    #     archived_files[file] = local_files[file]
+    if not extend_ignores(delete_from_local):
+        logging.error("A törlendő fájlok figyelmen kívül hagyása sikertelen, "
+                      "a törlések nem fognak megtörténni.")
+    else:
+        with NamedTemporaryFile() as f:
+            f.write("\n".join(delete_from_local))
+            subprocess.run(["rclone", "move", "--files-from", f.name,
+                           str(LOCAL_FOLDER), str(ARCHIVE_FOLDER)])
 
-    # for file in files_to_delete:
+    with NamedTemporaryFile() as f:
+        f.write("\n".join(delete_from_archive))
+        subprocess.run(["rclone", "move", "--files-from", f.name,
+                       str(ARCHIVE_FOLDER), str(TRASH_FOLDER)])
 
     eject(archive_device)
