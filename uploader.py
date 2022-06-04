@@ -1,11 +1,10 @@
 import logging
 from pathlib import Path
 from queue import Full, Queue
-import subprocess
 from tempfile import NamedTemporaryFile
 from threading import Lock, Thread
 
-import data_logger
+from util import run_command
 
 
 class Uploader:
@@ -36,16 +35,16 @@ class Uploader:
             self.upload_list_lock.release()
 
             f.write(files_str)
-            res = subprocess.run(self.get_command("copy", f.name), capture_output=True)
 
-            if res.returncode != 0:
-                logging.error("Fájlok feltöltése sikertelen volt.")
-                data_logger.log(stdout=res.stdout, stderr=res.stderr, files=files_str)
-            else:
-                logging.info("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                             files_str.count("\n") + 1,
-                             files_str[:files_str.find("\n")],
-                             files_str[files_str.rfind("\n"):])
+            res = run_command(self.get_command("copy", f.name),
+                              error_message="Hiba történt a fájlok feltöltése közben.",
+                              strict=False)
+
+            if res.returncode == 0:
+                logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
+                              files_str.count("\n") + 1,
+                              files_str[:files_str.find("\n")],
+                              files_str[files_str.rfind("\n"):])
                 with open(self.upload_list_file, "a+") as f:
                     f.write(files_str)
                     f.write("\n")
@@ -60,14 +59,13 @@ class Uploader:
             files_str = "\n".join(files)
             f.write(files_str)
 
-            res = subprocess.run(self.get_command("move", f.name), capture_output=True)
+            res = run_command(self.get_command("move", f.name),
+                              error_message="Hiba történt a fájlok feltöltése, áthelyezése közben.",
+                              strict=False)
 
-            if res.returncode != 0:
-                logging.error("Fájlok áthelyezése a felhőtárhelyre sikertelen.")
-                data_logger.log(stdout=res.stdout, stderr=res.stderr, files=files_str)
-            else:
-                logging.info("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                             len(files), files[0], files[-1])
+            if res.returncode == 0:
+                logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
+                              len(files), files[0], files[-1])
                 with open(self.upload_list_file, "a+") as f:
                     f.write(files_str)
                     f.write("\n")
@@ -75,12 +73,20 @@ class Uploader:
         self.upload_lock.release()
 
     def delete_file(self, path):
-        subprocess.run(["rclone", "deletefile", self.remote_folder.joinpath(path)])
+        logging.debug("Fájl törlése (%s).", path)
+        
+        run_command(["rclone", "deletefile", self.remote_folder.joinpath(path)],
+                    error_message=f"Hiba történt a '{path}' fájl törlése közben.", strict=False)
 
     def delete_folder(self, path):
-        subprocess.run(["rclone", "purge", self.remote_folder.joinpath(path)])
+        logging.debug("Mappa törlése (%s).", path)
+
+        run_command(["rclone", "purge", self.remote_folder.joinpath(path)],
+                    error_message=f"Hiba történt a '{path}' mappa törlése közben.", strict=False)
 
     def upload(self, file):
+        logging.debug("Fájl feltöltésre sorbaállítása (%s).", file)
+
         self.upload_list_lock.acquire()
         self.files_to_upload.append(file)
         self.upload_list_lock.release()

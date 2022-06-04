@@ -1,17 +1,21 @@
-from datetime import datetime, time, timedelta
 import logging
-from operator import itemgetter
-from queue import Queue
+from datetime import datetime, timedelta
 from multiprocessing import Process
+from pathlib import Path
 from time import sleep
-from typing import Callable, List, Optional, Union
-from dateutil import relativedelta, rrule, utils, tz
+from typing import Callable, List, Union
 
-from sync import archive
+from dateutil import relativedelta
+
+from sync import archive, check_sync
+from trashhandler import handle_trash
 
 FAILURE_EXPIRY_DAYS = 30
 MAX_FAILURES_PER_HOUR = 5
 MAX_FAILURES_PER_DAY = 20
+
+LOGGING_FILE = Path("~/bmt/")
+
 
 class TimedTask:
     def __init__(self,
@@ -42,7 +46,7 @@ class TimedTask:
     #     self.next_time = None
     #     self.process = None
     #     self.retry_count = 0
-        
+
     def get_next_scheduled(self):
         time = datetime.now()
         for field in self.time_fields:
@@ -57,10 +61,30 @@ class TimedTask:
         return 0 <= datetime.now() - scheduled_time < self.max_delay
 
 
-
 TASKS = (
-    TimedTask("archiválás", archive, datetime(2000, 1, 1, 0, 0, 0), ["day", "hour", "minute", "second"], relativedelta(month=1), timedelta(hours=4), timedelta(days=1)),
+    TimedTask("archiválás",
+              archive,
+              datetime(2000, 1, 1, 0, 0, 0),
+              ["day", "hour", "minute", "second"],
+              relativedelta(month=1),
+              timedelta(hours=4),
+              timedelta(days=1)),
+    TimedTask("feltöltés",
+              check_sync,
+              datetime(2000, 1, 1, 0, 0, 0),
+              ["hour", "minute", "second"],
+              timedelta(days=1),
+              timedelta(hours=4),
+              timedelta(hours=1)),
+    TimedTask("lomtalanítás",
+              handle_trash,
+              datetime(2000, 1, 5, 10, 0, 0)
+              ["day", "hour", "minute", "second"],
+              relativedelta(month=1),
+              timedelta(hours=24),
+              timedelta(days=1))
 )
+
 
 def start_main_loop() -> bool:
     """
@@ -83,12 +107,13 @@ def start_main_loop() -> bool:
             task.retry_count = 0
 
         if task.retry_count > task.max_retry_count:
-            logging.error(f"A(z) {task.name} feladat futtatása során az újrapróbálkozások száma "
-                          "meghaladta a megadott értéket ezért deaktiválásra került.")
+            logging.error("A(z) %s feladat futtatása során az újrapróbálkozások száma "
+                          "meghaladta a megadott értéket ezért deaktiválásra került.", task.name)
             task.enabled = False
 
         if not task.enabled:
-            logging.warning(f"A(z) {task.name} feladat deaktiválva van ezért nem kerül futtatásra.")
+            logging.warning("A(z) %s feladat deaktiválva van ezért nem kerül futtatásra.",
+                            task.name)
             continue
 
         seconds_until_task = (task.next_time - datetime.now()).total_seconds()
@@ -97,56 +122,60 @@ def start_main_loop() -> bool:
 
         if not task.check_if_ok_now(task.next_time):
             task.next_time = task.get_next_retry(task.next_time)
-            logging.info(f"A(z) {task.name} feladat a futtatása lekéste a "
-                         f"megfelelő intervallumot. Újrapróbálás ideje: {task.next_time.isoformat()}")
+            logging.info("A(z) %s feladat a futtatása lekéste a megfelelő intervallumot. "
+                         "Újrapróbálás ideje: %s", task.name, task.next_time.isoformat())
             task.retry_count += 1
             continue
 
         if task.process is not None and task.process.is_alive():
             task.next_time = task.get_next_retry(task.next_time)
-            logging.info(f"A(z) {task.name} feladat előző futtatása még nem fejeződött be, "
-                         f"ezért most nem indult el újra. Következő újrapróbálás ideje: "
-                         f"{task.next_time.isoformat()}")
+            logging.info("A(z) %s feladat előző futtatása még nem fejeződött be, "
+                         "ezért most nem indult el újra. Következő újrapróbálás ideje: %s",
+                         task.name, task.next_time.isoformat())
             task.retry_count += 1
             continue
-            
 
         try:
             task.process = Process(target=task.task)
             task.process.start()
-        except SystemExit as e:
-            logging.warning(f"A futtatott feladat ({task.name}) kilépést kért a programból: {e}")
-            return False
         except:
-            logging.error(f"Hiba történt a feladat ({task.name}) futtatása során.")
+            logging.error("Hiba történt a feladat (%s) elindítása során.", task.name)
             task.next_time = task.get_next_retry(task.next_time)
             raise
         else:
             task.next_time = task.get_next_scheduled()
 
 
-
 def main():
-    # logging.basicConfig()
+    logging.basicConfig(filename=LOGGING_FILE,
+                        format="%(asctime)s|%(levelname)s|%(message)s", level=logging.DEBUG)
+
     end = False
     failures = []
     while not end:
         try:
             end = not start_main_loop()
         except Exception as e:
-            logging.error(f"Hiba történt a program futása során: {e}")
+            logging.error("Hiba történt a program futása során: %s", e)
             current_time = datetime.now()
 
-            failures = [time for time in failures if current_time - time <= timedelta(days=FAILURE_EXPIRY_DAYS)]
+            failures = [time for time in failures
+                        if current_time - time <= timedelta(days=FAILURE_EXPIRY_DAYS)]
 
             failures.append(current_time)
-            
-            if sum(1 for time in failures if current_time - time < timedelta(hours=1)) > MAX_FAILURES_PER_HOUR:
-                logging.error(f"Az utóbbi órában több, mint {MAX_FAILURES_PER_HOUR} hiba történt, ezért az alkalmazás leáll.")
+
+            if sum(1 for time in failures if current_time - time < timedelta(hours=1)) \
+                > MAX_FAILURES_PER_HOUR:
+
+                logging.error("Az utóbbi órában több, mint %d hiba történt, ezért az alkalmazás "
+                              "leáll.", MAX_FAILURES_PER_HOUR)
                 break
 
-            if sum(1 for time in failures if current_time - time < timedelta(days=1)) > MAX_FAILURES_PER_DAY:
-                logging.error(f"Az utóbbi 24 órában több, mint {MAX_FAILURES_PER_DAY} hiba történt, ezért az alkalmazás leáll.")
+            if sum(1 for time in failures if current_time - time < timedelta(days=1)) \
+                > MAX_FAILURES_PER_DAY:
+
+                logging.error("Az utóbbi 24 órában több, mint %d hiba történt, ezért az "
+                              "alkalmazás leáll.", MAX_FAILURES_PER_DAY)
                 break
 
 
