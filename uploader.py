@@ -74,6 +74,12 @@ class Uploader:
 
         self.upload_lock.release()
 
+    def delete_file(self, path):
+        subprocess.run(["rclone", "deletefile", self.remote_folder.joinpath(path)])
+
+    def delete_folder(self, path):
+        subprocess.run(["rclone", "purge", self.remote_folder.joinpath(path)])
+
     def upload(self, file):
         self.upload_list_lock.acquire()
         self.files_to_upload.append(file)

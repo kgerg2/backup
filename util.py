@@ -1,3 +1,4 @@
+import subprocess
 import csv
 from datetime import datetime, timedelta
 import logging
@@ -30,6 +31,13 @@ class CSVDialect(csv.Dialect):
     strict: bool = False
 
 
+def freeze(obj):
+    if isinstance(obj, (list, tuple)):
+        return tuple(map(freeze, obj))
+
+    return obj
+
+
 def read_csv(path):
     with open(path, newline="") as f:
         reader = csv.reader(f, dialect=CSVDialect)
@@ -47,9 +55,42 @@ def write_csv(path, data: Iterable[Iterable]):
         writer.writerows(data)
 
 
+def union_csv(path, data: Iterable[Iterable]):
+    data = set(freeze(data))
+    with open(path, "a+", newline="") as f:
+        reader = csv.reader(f, dialect=CSVDialect)
+        for line in reader:
+            data.discard(tuple(line))
+        writer = csv.writer(f, dialect=CSVDialect)
+        writer.writerows(data)
+
+
 def update_file_info(file, data: Dict[str, Tuple[str, datetime, int]]):
     write_csv(file, ((name, hash, time.strftime(TIME_FORMAT), size)
-              for name, (hash, time, size) in data.items()))
+                     for name, (hash, time, size) in data.items()))
+
+
+def extend_file_info(file, data: Dict[str, Tuple[str, datetime, int]]):
+    union_csv(file, ((name, hash, time.strftime(TIME_FORMAT), str(size))
+                     for name, (hash, time, size) in data.items()))
+
+
+def get_file_details(path: Path) -> Tuple[str, datetime, int]:
+    r = subprocess.run(["rclone", "hashsum", "quickxor", str(path)], capture_output=True)
+    if r.returncode:
+        logging.error("Nem sikerült a fájl hashjének meghatározása. (hibakód: %d, '%s', '%s')",
+                      r.returncode, r.stdout, r.stderr)
+        hashsum = ""
+    else:
+        hashsum = r.stdout.split()[0].decode("utf-8")
+
+    stat = path.stat()
+    return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
+
+
+def delete_from_file_info(file, data: Dict[str, Tuple[str, datetime, int]]):
+    union_csv(file, ((name, hash, time.strftime(TIME_FORMAT), str(size))
+                     for name, (hash, time, size) in data.items()))
 
 
 def is_same_file(file1: Tuple[str, datetime, int], file2: Tuple[str, datetime, int]) -> bool:
@@ -141,7 +182,6 @@ def extend_ignores(new: Iterable[Union[Path, str]]) -> bool:
         logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt, "
                       "az új elemek hozzáadása sikertelen.")
         return False
-
 
     res = post_syncthing("db/ignores", {"ignore": list(ignores)}, {"folder": FOLDER_ID})
     print(res)
