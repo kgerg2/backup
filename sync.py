@@ -105,7 +105,7 @@ def sync_from_cloud():
     logging.debug("A felhőben végzett módosítások sinkronizálása.")
     onedrive_uploader = Uploader(LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
 
-    files = update_all_files() | get_file_info(CLOUD_ONLY_FILES)
+    files = update_all_files(return_directories=False) | get_file_info(CLOUD_ONLY_FILES)
     logging.debug("Fájlok meghatározása sikeres.")
     with TemporaryDirectory() as tempdir:
         dir_path = Path(tempdir)

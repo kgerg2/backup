@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -49,8 +50,20 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
             added.add(path_str)
             continue
 
-        if not is_same_file((datetime.fromisoformat(file["modTime"][:26] + file["modTime"][-6:]),
-                             file["size"]), all_files[path_str]):
+        match = re.fullmatch(r"(\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{6})?\d*(\+\d\d:\d\d)", file["modTime"])
+
+        if match is None:
+            logging.error("Egy fájl módosítási ideje ismeretlen formátumú: %s (%s)",
+                          file["modTime"], file["name"])
+            removed.remove(path_str)
+            continue
+        
+        date_time, ms, timezone = match.groups()
+        ms = ms or ".000000"
+        timezone = timezone or "+02:00"
+        iso_time = "".join((date_time, ms, timezone))
+
+        if not is_same_file((datetime.fromisoformat(iso_time), file["size"]), all_files[path_str]):
             changed.add(path_str)
 
         try:
@@ -60,7 +73,7 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
                             " került.", path_str)
 
 
-def update_all_files() -> Dict[str, Tuple[str, datetime, int]]:
+def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, datetime, int]]:
     try:
         known_files = get_file_info(ALL_FILES)
     except FileNotFoundError:
@@ -109,6 +122,10 @@ def update_all_files() -> Dict[str, Tuple[str, datetime, int]]:
         update_file_info(ALL_FILES, known_files)
     elif exists:
         extend_file_info(ALL_FILES, exists)
+
+    if not return_directories:
+        known_files = {file: (hash, mod_time, size) for file, (hash, mod_time, size)
+                       in known_files.items() if hash is not None}
 
     return known_files
         
@@ -175,7 +192,7 @@ def sync_with_archive(freeup_needed: int = 0):
     with open(IGNORE_FILE, encoding="utf-8") as f:
         ignore_patterns = f.readlines()
 
-    global_files = update_all_files()
+    global_files = update_all_files(return_directories=False)
 
     with TemporaryDirectory() as tempdir:
         dir_path = Path(tempdir)

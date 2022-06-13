@@ -82,7 +82,7 @@ def run_command(command: List[Union[str, Path]], error_message: str = "", strict
 
 def get_file_info(file: Union[Path, str]) -> Dict[str, Tuple[str, datetime, int]]:
     logging.debug("Adatfájl beolvasása: %s", file)
-    return {name: (hash, datetime.strptime(time, TIME_FORMAT), int(size))
+    return {name: (hash if hash else None, datetime.strptime(time, TIME_FORMAT), int(size))
             for name, hash, time, size in read_csv(file)}
 
 
@@ -113,19 +113,23 @@ def extend_file_info(file: Union[Path, str], data: Dict[str, Tuple[str, datetime
 
 
 def get_file_details(path: Path) -> Tuple[str, datetime, int]:
-    r = run_command(["rclone", "hashsum", "quickxor", str(path)],
-                    error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
-                    strict=False)
-    if r.returncode:
-        hashsum = DEFAULT_HASHSUM
+    if path.is_dir():
+        hashsum = None
     else:
-        try:
-            hashsum = r.stdout.split()[0].decode("utf-8")
-        except IndexError:
-            logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
+        r = run_command(["rclone", "hashsum", "quickxor", str(path)],
+                        error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
+                        strict=False)
+        if r.returncode:
             hashsum = DEFAULT_HASHSUM
+        else:
+            try:
+                hashsum = r.stdout.split()[0].decode("utf-8")
+            except IndexError:
+                logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
+                hashsum = DEFAULT_HASHSUM
 
     stat = path.stat()
+        
     return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
 
 
