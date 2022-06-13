@@ -1,20 +1,18 @@
 import logging
 from datetime import datetime, timedelta
+from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import Process
-from pathlib import Path
+from multiprocessing.connection import Listener
 from time import sleep
 from typing import Callable, List, Union
 
-from dateutil import relativedelta
+from dateutil.relativedelta import relativedelta
 
-from sync import archive, check_sync
+from archiver import archive
+from config import (FAILURE_EXPIRY_DAYS, LOGGING_FILE, MAX_FAILURES_PER_DAY,
+                    MAX_FAILURES_PER_HOUR, MESSAGE_LISTENER_ADDRESS, MESSAGE_LISTENER_AUTH_TOKEN)
+from sync import check_sync, sync_from_cloud, sync_to_cloud
 from trashhandler import handle_trash
-
-FAILURE_EXPIRY_DAYS = 30
-MAX_FAILURES_PER_HOUR = 5
-MAX_FAILURES_PER_DAY = 20
-
-LOGGING_FILE = Path("~/bmt/")
 
 
 class TimedTask:
@@ -23,9 +21,9 @@ class TimedTask:
                  task: Callable,
                  time: datetime,
                  time_fields: List[str],
-                 time_diff: Union[relativedelta.relativedelta, timedelta],
+                 time_diff: Union[relativedelta, timedelta],
                  max_delay: timedelta,
-                 retry_time: Union[relativedelta.relativedelta, timedelta],
+                 retry_time: Union[relativedelta, timedelta],
                  max_retry_count: int = 10,
                  enabled: bool = True):
         self.name = name
@@ -48,41 +46,73 @@ class TimedTask:
     #     self.retry_count = 0
 
     def get_next_scheduled(self):
-        time = datetime.now()
-        for field in self.time_fields:
-            time.replace(**{field: getattr(self.time, field)})
-        time += self.time_diff
+        time = datetime.now().replace(**{field: getattr(self.time, field) for field in self.time_fields})
+        maxiter = 10
+        while time < datetime.now() and maxiter > 0:
+            maxiter -= 1
+            time += self.time_diff
+
+        if maxiter == 0:
+            logging.warning("A %s feladathoz megfelelő időpont meghatározása sikertelen. (érték: %s)", self.name, time)
+
         return time
 
     def get_next_retry(self, scheduled_time):
         return scheduled_time + self.retry_time
 
     def check_if_ok_now(self, scheduled_time):
-        return 0 <= datetime.now() - scheduled_time < self.max_delay
+        return timedelta(0) <= datetime.now() - scheduled_time < self.max_delay
 
+message_server_process = None
+
+
+def check_message_server():
+    global message_server_process
+
+    logging.debug("Az üzenetek fogadásáért felelős folyamat futásának ellenőrzése.")
+
+    if not message_server_process.is_alive():
+        logging.warning("Az üzenetek fogadásáért felelős folyamat nem fut, úrjaindításra kerül. "
+                        "Leállás hibakódja: %d", message_server_process.exitcode)
+        message_server_process = Process(target=message_server)
+        message_server_process.start()
 
 TASKS = (
     TimedTask("archiválás",
               archive,
               datetime(2000, 1, 1, 0, 0, 0),
               ["day", "hour", "minute", "second"],
-              relativedelta(month=1),
+              relativedelta(months=1),
               timedelta(hours=4),
               timedelta(days=1)),
-    TimedTask("feltöltés",
+    TimedTask("feltöltés ellenőrzése",
               check_sync,
-              datetime(2000, 1, 1, 0, 0, 0),
+              datetime(2000, 1, 1, 1, 0, 0),
               ["hour", "minute", "second"],
               timedelta(days=1),
               timedelta(hours=4),
               timedelta(hours=1)),
+    TimedTask("letöltés",
+              sync_from_cloud,
+              datetime(2000, 1, 1, 23, 0, 0),
+              ["hour", "minute", "second"],
+              timedelta(days=1),
+              timedelta(hours=2),
+              timedelta(hours=1)),
     TimedTask("lomtalanítás",
               handle_trash,
-              datetime(2000, 1, 5, 10, 0, 0)
+              datetime(2000, 1, 5, 10, 0, 0),
               ["day", "hour", "minute", "second"],
-              relativedelta(month=1),
+              relativedelta(months=1),
               timedelta(hours=24),
-              timedelta(days=1))
+              timedelta(days=1)),
+    TimedTask("üzenetfogadás ellenőrzése",
+              check_message_server,
+              datetime(2000, 1, 1, 1, 0, 0),
+              ["hour", "minute", "second"],
+              timedelta(days=1),
+              timedelta(hours=4),
+              timedelta(hours=1))
 )
 
 
@@ -99,7 +129,7 @@ def start_main_loop() -> bool:
         task.retry_count = 0
 
     while True:
-        task = min(TASKS, lambda x: x.next_time)
+        task = min(TASKS, key=lambda x: x.next_time)
 
         if task.process is not None and task.process.exitcode:
             task.retry_count += 1
@@ -137,6 +167,7 @@ def start_main_loop() -> bool:
 
         try:
             task.process = Process(target=task.task)
+            logging.debug("Feladat indítása: %s", task.name)
             task.process.start()
         except:
             logging.error("Hiba történt a feladat (%s) elindítása során.", task.name)
@@ -146,9 +177,52 @@ def start_main_loop() -> bool:
             task.next_time = task.get_next_scheduled()
 
 
+def message_server():
+    logging.debug("Üzenetfogadásért felelős folyamat elindul.")
+    
+    commands = {
+        "archive": archive,
+        "check_upload": check_sync,
+        "upload": sync_to_cloud,
+        "download": sync_from_cloud,
+        "trash": handle_trash
+    }
+    listener = Listener(MESSAGE_LISTENER_ADDRESS, authkey=MESSAGE_LISTENER_AUTH_TOKEN)
+
+    while True:
+        conn = listener.accept()
+        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
+        while True:
+            try:
+                msg = conn.recv()
+            except EOFError:
+                break
+
+            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
+            if msg in commands:
+                commands[msg]()
+            # if msg == 'close connection':
+            #     conn.close()
+            #     break
+            if msg == 'close server':
+                conn.close()
+                listener.close()
+                return
+
+    listener.close()
+
+
 def main():
-    logging.basicConfig(filename=LOGGING_FILE,
-                        format="%(asctime)s|%(levelname)s|%(message)s", level=logging.DEBUG)
+    global message_server_process
+
+    logging.basicConfig(format="%(asctime)s|%(levelname)s|%(filename)s:%(funcName)s(%(lineno)d)|%(message)s",
+                        level=logging.DEBUG,
+                        handlers=(TimedRotatingFileHandler(LOGGING_FILE, atTime="midnight"),))
+    
+    logging.debug("Program indul.")
+
+    message_server_process = Process(target=message_server)
+    message_server_process.start()
 
     end = False
     failures = []

@@ -3,26 +3,16 @@ from multiprocessing import Process
 from pathlib import Path
 from pprint import pformat
 from tempfile import NamedTemporaryFile, TemporaryDirectory
+import traceback
+from archiver import update_all_files
 
 import data_logger
+from config import (ALL_FILES, CLOUD_ONLY_FILES, LAST_SYNC_EVENT_FILE, LOCAL_FOLDER, REMOTE_FOLDER,
+                    UPLOADED_FILES)
 from uploader import Uploader
-from util import (extend_file_info, get_file_details, get_file_info,
-                  get_syncthing, read_path_list, run_command, update_file_info, write_checkfile)
-
-
-API_KEY = "KaK7CFasJCLAoSCsHtZjvEoC7LZwAvqi"
-FOLDER_ID = "pfkxq-prxga"
-FOLDER = Path("~/bmt").expanduser()
-IGNORE_FILE = FOLDER.joinpath(".stignore")
-BACKUP_FOLDER = Path("~/bmt-tavoli").expanduser()
-REMOTE_FOLDER = Path("onedrive-kifu:bmt")
-
-METADATA_FOLDER = FOLDER.joinpath(".backupdata")
-BACKUP_FILE_LIST = METADATA_FOLDER.joinpath("backup-files.txt")
-UPLOADED_FILES = METADATA_FOLDER.joinpath("onedrive-files.txt")
-
-ALL_FILES = Path("~/bmt/")
-CLOUD_ONLY_FILES = Path("~/bmt/")
+from util import (extend_file_info, get_file_details, get_file_info, get_remote_mod_times,
+                  get_syncthing, read_path_list, run_command, update_file_info,
+                  write_checkfile)
 
 
 def get_change(last_event=0, timeout=60):
@@ -34,6 +24,8 @@ last_sync_event = 0
 
 
 def check_sync():
+    global sync_process, last_sync_event
+
     logging.debug("A szinkronizáló folyamat futásának ellenőrzése.")
 
     if sync_process is None:
@@ -48,9 +40,17 @@ def check_sync():
 
 
 def sync_to_cloud():
+    global last_sync_event
+
     logging.debug("A bejövő módosítások figyelése indul.")
 
-    onedrive_uploader = Uploader(FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
+    try:
+        with open(LAST_SYNC_EVENT_FILE, encoding="utf-8") as f:
+            last_sync_event = int(f.read())
+    except:
+        last_sync_event = 0
+
+    onedrive_uploader = Uploader(LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
     while True:
         res = get_change(last_event=last_sync_event, timeout=3600)
         new_files = []
@@ -59,7 +59,7 @@ def sync_to_cloud():
             logging.debug(pformat(change))
             last_sync_event = change["id"]
             if change["type"] == "RemoteChangeDetected":
-                relpath = Path(change["data"]["path"]).relative_to(FOLDER)
+                relpath = change["data"]["path"]
                 if change["data"]["action"] == "deleted":
                     if change["data"]["type"] == "file":
                         onedrive_uploader.delete_file(relpath)
@@ -74,31 +74,39 @@ def sync_to_cloud():
                     onedrive_uploader.upload(relpath)
                     new_files.append(relpath)
 
-        new_file_details = {str(path): get_file_details(FOLDER.joinpath(path))
-                            for path in new_files}
+        new_file_details = {str(path): get_file_details(LOCAL_FOLDER.joinpath(path))
+                            for path in new_files if LOCAL_FOLDER.joinpath(path).exists()}
 
         if deleted_files:
             all_info = get_file_info(ALL_FILES)
             for deleted in deleted_files:
-                all_info.pop(deleted)
+                try:
+                    all_info.pop(deleted)
+                except KeyError:
+                    logging.warning("Egy fájl törölve lett, de nem szerepel az összes között: %s",
+                                    deleted)
             all_info.update(new_file_details)
             update_file_info(ALL_FILES, all_info)
-            with open(UPLOADED_FILES) as f:
+            with open(UPLOADED_FILES, encoding="utf-8") as f:
                 uploaded_files = set(f.read().splitlines())
             uploaded_files = uploaded_files - set(deleted_files)
-            with open(UPLOADED_FILES) as f:
+            with open(UPLOADED_FILES, "w", encoding="utf-8") as f:
                 for file in uploaded_files:
                     f.write(file)
                     f.write("\n")
         else:
             extend_file_info(ALL_FILES, new_file_details)
 
+        with open(LAST_SYNC_EVENT_FILE, "w", encoding="utf-8") as f:
+            f.write(str(last_sync_event))
+
 
 def sync_from_cloud():
     logging.debug("A felhőben végzett módosítások sinkronizálása.")
-    onedrive_uploader = Uploader(FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
+    onedrive_uploader = Uploader(LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
 
-    files = get_file_info(ALL_FILES) | get_file_info(CLOUD_ONLY_FILES)
+    files = update_all_files() | get_file_info(CLOUD_ONLY_FILES)
+    logging.debug("Fájlok meghatározása sikeres.")
     with TemporaryDirectory() as tempdir:
         dir_path = Path(tempdir)
         checkfile = dir_path.joinpath("checkfile.txt")
@@ -109,18 +117,27 @@ def sync_from_cloud():
         remotely_added_files = dir_path.joinpath("deleted.txt")
 
         run_command(["rclone", "check", checkfile, REMOTE_FOLDER,
-                     "--checkcfile", "QuickXorHash",
+                     "--checkfile", "QuickXorHash",
                      "--differ", differing_files_path,
                      "--missing-on-dst", not_uploaded_files_path,
                      "--missing-on-src", remotely_added_files],
                     error_message="A felhővel szinfronizálandó fájlok meghatározása nem sikerült, "
-                    "az összehasonlítás meghiúsult.", expected_returncodes=(1,))
+                    "az összehasonlítás meghiúsult.", expected_returncodes=(1, 3))
         
         bisync_files = read_path_list(differing_files_path, default=[])
 
         upload_files = read_path_list(not_uploaded_files_path, default=[])
 
         download_files = set(read_path_list(remotely_added_files, default=[]))
+
+    remote_times = get_remote_mod_times(bisync_files)
+    for file in bisync_files:
+        if remote_times[file][0] > files[file][1]:
+            download_files.add(file)
+        else:
+            upload_files.append(file)
+
+    data_logger.log(bisync_files=bisync_files, upload_files=upload_files, download_files=download_files)
 
     if download_files:
         try:
@@ -135,24 +152,17 @@ def sync_from_cloud():
                 for file in deletion_missed:
                     onedrive_uploader.delete_file(file)
 
-            with NamedTemporaryFile() as f:
+            with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
-                run_command(["rclone", "copy", REMOTE_FOLDER, FOLDER, "--files-from", f.name],
+                f.flush()
+                run_command(["rclone", "copy", REMOTE_FOLDER, LOCAL_FOLDER, "--files-from", f.name],
                             error_message="Új fájlok letöltése sikertelen.", strict=False)
         except (FileNotFoundError, OSError) as e:
-            logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s", e)
+            logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s", traceback.format_exc())
 
     if upload_files:
-        with NamedTemporaryFile() as f:
+        with NamedTemporaryFile(mode="w") as f:
             f.write("\n".join(upload_files))
-            run_command(["rclone", "copy", FOLDER, REMOTE_FOLDER, "--files-from", f.name],
+            f.flush()
+            run_command(["rclone", "copy", LOCAL_FOLDER, REMOTE_FOLDER, "--files-from", f.name],
                         error_message="Hiba történt az új fájlok feltöltése közben.", strict=False)
-
-    if bisync_files:
-        with NamedTemporaryFile() as f:
-            f.write(f"+ {path}\n" for path in bisync_files)
-            f.write("- *")
-            run_command(["rclone", "bisync", FOLDER, REMOTE_FOLDER, "--filters-file", f.name,
-                         "--resync"],
-                        error_message="Hiba történt a különböző fájlok szinkronizálása közben.",
-                        strict=False)

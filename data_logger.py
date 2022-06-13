@@ -1,4 +1,6 @@
 from datetime import datetime
+import logging
+from multiprocessing import Process
 from pathlib import Path
 from threading import Lock, Thread
 
@@ -10,7 +12,7 @@ def configure(log_path: Path):
     log_folder = log_path
 
 def get_time():
-    return datetime.now().strftime("%Y-%m-%d_%H.%M.%s,%f")
+    return datetime.now().strftime("%Y-%m-%d_%H.%M.%S,%f")
 
 def log(*args, **kwargs):
     """
@@ -18,28 +20,32 @@ def log(*args, **kwargs):
     Arguments should be strings.
     """
     if kwargs:
-        Thread(target=log_dir, kwargs=kwargs).start()
+        Process(target=log_dir, kwargs=kwargs).start()
     else:
-        Thread(target=log_files, args=args).start()
+        Process(target=log_files, args=args).start()
     
 def log_dir(**kwargs):
     time = get_time()
     folder_name = time
 
     file_creation_lock.acquire()
-    if count := len(f for f in log_folder.glob(f"{time}*") if f.is_dir()):
+    if count := sum(1 for f in log_folder.glob(f"{time}*") if f.is_dir()):
         folder_name = f"{time}-{count}"
-    log_folder.mkdir(folder_name)
+    log_folder.joinpath(folder_name).mkdir()
     file_creation_lock.release()
 
     folder = log_folder.joinpath(folder_name)
-    for k, v in kwargs:
-        with open(folder.joinpath(f"{k}.log"), "a+") as f:
-            f.write(v)
+    for k, v in kwargs.items():
+        with open(folder.joinpath(f"{k}.log"), "a+", encoding="utf-8") as f:
+            if isinstance(v, bytes):
+                f.write(v.decode())
+            else:
+                f.write(str(v))
 
-def log_files(time=None, *args):
-    if time is None:
-        time = get_time()
+def log_files(*args):
+    # logging.debug("Fájlok írása: %s", args)
+    
+    time = get_time()
 
     for data in args:
         log_file(data, time)
@@ -49,11 +55,15 @@ def log_file(data: str, time: str=None):
         time = get_time()
     filename = f"{time}.log"
 
-    file_creation_lock.acquire()
-    if count := len(log_folder.glob(f"{time}*")):
+    if not file_creation_lock.acquire(timeout=30):
+        logging.debug("A lock megszerzése sikertelen.")
+    if count := sum(1 for _ in log_folder.glob(f"{time}*")):
         filename = f"{time}-{count}.log"
-    with open(log_folder.joinpath(filename), "a+") as f:
+    logging.debug("Napló írása %s fájlba.", log_folder.joinpath(filename))
+    with open(log_folder.joinpath(filename), "a+", encoding="utf-8") as f:
         file_creation_lock.release()
-
-        f.write(data)
+        if isinstance(data, bytes):
+            f.write(data.decode())
+        else:
+            f.write(str(data))
 

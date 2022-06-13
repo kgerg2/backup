@@ -1,8 +1,9 @@
 import logging
+from multiprocessing import Process
 from pathlib import Path
-from queue import Full, Queue
+from queue import Empty, Full, Queue
 from tempfile import NamedTemporaryFile
-from threading import Lock, Thread
+from threading import Lock
 
 from util import run_command
 
@@ -27,29 +28,45 @@ class Uploader:
         logging.debug("Új feltöltés kezdeményezve. Várakozás az előző befejeztére...")
         self.upload_lock.acquire()
 
-        with NamedTemporaryFile("w", suffix=".txt") as f:
-            self.upload_list_lock.acquire()
-            logging.debug("%d fájl feltöltése elkezdődik.", len(self.files_to_upload))
-            files_str = "\n".join(self.files_to_upload)
-            self.files_to_upload.clear()
-            self.upload_list_lock.release()
+        try:
+            with NamedTemporaryFile("w", suffix=".txt") as f:
+                self.upload_list_lock.acquire()
+                logging.debug("%d fájl feltöltése elkezdődik.", len(self.files_to_upload))
+                files_str = "\n".join(self.files_to_upload)
+                self.files_to_upload.clear()
+                self.upload_list_lock.release()
 
-            f.write(files_str)
-
-            res = run_command(self.get_command("copy", f.name),
-                              error_message="Hiba történt a fájlok feltöltése közben.",
-                              strict=False)
+                f.write(files_str)
+                f.flush()
+                res = run_command(self.get_command("copy", f.name) + ["-vv"],
+                                error_message="Hiba történt a fájlok feltöltése közben.",
+                                strict=False)
 
             if res.returncode == 0:
                 logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                              files_str.count("\n") + 1,
-                              files_str[:files_str.find("\n")],
-                              files_str[files_str.rfind("\n"):])
-                with open(self.upload_list_file, "a+") as f:
+                                files_str.count("\n") + 1,
+                                files_str[:files_str.find("\n")],
+                                files_str[files_str.rfind("\n")+1:])
+                with open(self.upload_list_file, "a+", encoding="utf-8") as f:
                     f.write(files_str)
                     f.write("\n")
 
-        self.upload_lock.release()
+            try:
+                self.upload_threads.get_nowait()
+            except Empty:
+                logging.warning("A feltöltő folyamatokat tartalmazó sorban nem található elem.")
+
+            if self.upload_threads.empty() and self.files_to_upload:
+                logging.warning("Feltöltést végző folyamat nem várakozik, pedig vannak feltöltendő "
+                                "fájlok. Elindítása most megtörténik.")
+                try:
+                    thread = Process(target=self.run_upload)
+                    self.upload_threads.put_nowait(thread)
+                    thread.start()
+                except Full:
+                    pass
+        finally:
+            self.upload_lock.release()
 
     def run_move(self, files):
         logging.debug("Áthelyezés kezdeményezve a felhőtárhelyre. Várakozás...")
@@ -58,17 +75,17 @@ class Uploader:
         with NamedTemporaryFile("w", suffix=".txt") as f:
             files_str = "\n".join(files)
             f.write(files_str)
-
+            f.flush()
             res = run_command(self.get_command("move", f.name),
                               error_message="Hiba történt a fájlok feltöltése, áthelyezése közben.",
                               strict=False)
 
-            if res.returncode == 0:
-                logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                              len(files), files[0], files[-1])
-                with open(self.upload_list_file, "a+") as f:
-                    f.write(files_str)
-                    f.write("\n")
+        if res.returncode == 0:
+            logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
+                            len(files), files[0], files[-1])
+            with open(self.upload_list_file, "a+", encoding="utf-8") as f:
+                f.write(files_str)
+                f.write("\n")
 
         self.upload_lock.release()
 
@@ -88,12 +105,12 @@ class Uploader:
         logging.debug("Fájl feltöltésre sorbaállítása (%s).", file)
 
         self.upload_list_lock.acquire()
-        self.files_to_upload.append(file)
+        self.files_to_upload.append(str(file))
         self.upload_list_lock.release()
 
         try:
-            thread = Thread(target=self.run_upload)
+            thread = Process(target=self.run_upload)
             self.upload_threads.put_nowait(thread)
-            thread.run()
+            thread.start()
         except Full:
             pass
