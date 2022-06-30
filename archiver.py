@@ -13,7 +13,7 @@ from requests.exceptions import JSONDecodeError
 
 import data_logger
 from config import (ALL_FILES, ARCHIVE_FOLDER, CONFIG_DATA, FOLDER_ID,
-                    IGNORE_FILE, LOCAL_FOLDER, REMOTE_FOLDER, TRASH_FOLDER)
+                    IGNORE_FILE, KEEP_AGE, LOCAL_FOLDER, REMOTE_FOLDER, TIMEZONE, TRASH_FOLDER)
 from util import (extend_file_info, extend_ignores, get_file_details,
                   get_file_info, get_syncthing, is_same_file, read_path_list,
                   run_command, update_file_info, write_checkfile)
@@ -28,7 +28,7 @@ def get_files(folder: Path, ignores: Iterable[str]) -> Dict[Path, Tuple[datetime
         relative_path = path.relative_to(folder)
         if not any(relative_path.is_relative_to(pattern) for pattern in ignores):
             files[relative_path] = (datetime.fromtimestamp(stat.st_mtime)
-                                            .astimezone(ZoneInfo("Europe/Budapest")),
+                                            .astimezone(TIMEZONE),
                                     stat.st_size)
 
     return files
@@ -190,7 +190,7 @@ def archive(freeup_needed: int = 0) -> None:
 
 def sync_with_archive(freeup_needed: int = 0):
     with open(IGNORE_FILE, encoding="utf-8") as f:
-        ignore_patterns = f.readlines()
+        ignore_patterns = f.read().splitlines()
 
     global_files = update_all_files(return_directories=False)
 
@@ -223,6 +223,15 @@ def sync_with_archive(freeup_needed: int = 0):
     local_files = get_files(LOCAL_FOLDER, ignore_patterns)
 
     delete_from_local = []
+    freed_up_space = 0
+
+    if KEEP_AGE is not None:
+        delete_from_local, freed_up_spaces = tuple(zip(*((file, size) for file, (time, size)
+                                                   in local_files.items()
+                                                   if datetime.now(TIMEZONE) - time > KEEP_AGE))) \
+                                             or ([], [0])
+        freed_up_space = sum(freed_up_spaces)
+
 
     if freeup_needed < 0:
         logging.warning("A kért felszabadítandó tárhely mérete negatív (%d).", freeup_needed)
@@ -241,17 +250,14 @@ def sync_with_archive(freeup_needed: int = 0):
             logging.warning("Nem lehetséges elegendő tárhely felszabadítása. Kért mennyiség: %d, "
                             "teljesíthető: %d", freeup_needed, freed_up_space)
             
-    # if logging._Level == "DEBUG":
-    # logging.debug("Log szint: %s", logging._Level)
     data_logger.log(copy_to_archive=copy_to_archive, delete_from_archive=delete_from_archive, delete_from_local=delete_from_local)
     # Copy files to archive
 
     with NamedTemporaryFile(mode="w") as f:
         f.write("\n".join(copy_to_archive))
         f.flush()
-        r = run_command(["rclone", "copy", "--files-from", f.name, LOCAL_FOLDER, ARCHIVE_FOLDER, "-vv"],
+        run_command(["rclone", "copy", "--files-from", f.name, LOCAL_FOLDER, ARCHIVE_FOLDER, "-vv"],
                     error_message="hiba történt az archiválás során.", strict=False)
-        print(r)
 
     # Delete archived and synced files
 
@@ -282,10 +288,10 @@ def sync_with_archive(freeup_needed: int = 0):
     if delete_from_local:
         if not extend_ignores(delete_from_local):
             logging.error("A törlendő fájlok figyelmen kívül hagyása sikertelen, "
-                        "a törlések nem fognak megtörténni.")
+                          "a törlések nem fognak megtörténni.")
         else:
             with NamedTemporaryFile(mode="w") as f:
-                f.write("\n".join(delete_from_local))
+                f.write("\n".join(map(str, delete_from_local)))
                 f.flush()
                 run_command(["rclone", "move", "--files-from", f.name, LOCAL_FOLDER,
                             ARCHIVE_FOLDER], error_message="A fájlok archívumba történő "

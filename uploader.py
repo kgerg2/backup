@@ -4,8 +4,9 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from tempfile import NamedTemporaryFile
 from threading import Lock
+from typing import Union
 
-from util import run_command
+from util import read_path_list, run_command
 
 
 class Uploader:
@@ -72,6 +73,10 @@ class Uploader:
         logging.debug("Áthelyezés kezdeményezve a felhőtárhelyre. Várakozás...")
         self.upload_lock.acquire()
 
+        with open(self.upload_list_file, "a+", encoding="utf-8") as f:
+            f.write(files_str)
+            f.write("\n")
+
         with NamedTemporaryFile("w", suffix=".txt") as f:
             files_str = "\n".join(files)
             f.write(files_str)
@@ -83,29 +88,54 @@ class Uploader:
         if res.returncode == 0:
             logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
                             len(files), files[0], files[-1])
-            with open(self.upload_list_file, "a+", encoding="utf-8") as f:
-                f.write(files_str)
-                f.write("\n")
 
         self.upload_lock.release()
 
     def delete_file(self, path):
         logging.debug("Fájl törlése (%s).", path)
         
-        run_command(["rclone", "deletefile", self.remote_folder.joinpath(path)],
-                    error_message=f"Hiba történt a '{path}' fájl törlése közben.", strict=False)
+        r = run_command(["rclone", "deletefile", self.remote_folder.joinpath(path)],
+                        error_message=f"Hiba történt a '{path}' fájl törlése közben.",
+                        strict=False)
+
+        if r.returncode != 0:
+            return
+
+        uploaded_files = set(read_path_list(self.upload_list_file))
+
+        uploaded_files.discard(path)
+
+        with open(self.upload_list_file, "w") as f:
+            f.write("\n".join(uploaded_files))
 
     def delete_folder(self, path):
         logging.debug("Mappa törlése (%s).", path)
 
-        run_command(["rclone", "purge", self.remote_folder.joinpath(path)],
-                    error_message=f"Hiba történt a '{path}' mappa törlése közben.", strict=False)
+        r = run_command(["rclone", "purge", self.remote_folder.joinpath(path)],
+                        error_message=f"Hiba történt a '{path}' mappa törlése közben.", strict=False)
 
-    def upload(self, file):
-        logging.debug("Fájl feltöltésre sorbaállítása (%s).", file)
+        if r.returncode != 0:
+            return
+
+        uploaded_files = set(read_path_list(self.upload_list_file))
+
+        uploaded_files = {file for file in uploaded_files if not Path(file).is_relative_to(path)}
+
+        with open(self.upload_list_file, "w") as f:
+            f.write("\n".join(uploaded_files))
+
+    def upload(self, *files: Union[str, Path]) -> None:
+        if not files:
+            logging.warning("Feltöltés lett kezdeményezve, de nincs fájl megadva.")
+            return
+
+        if len(files) == 1:
+            logging.debug("Fájl feltöltésre sorbaállítása (%s).", files[0])
+        else:
+            logging.debug("Fájlok feltöltésre sorbaállítása (%s - %s)", files[0], files[-1])
 
         self.upload_list_lock.acquire()
-        self.files_to_upload.append(str(file))
+        self.files_to_upload.extend(map(str, files))
         self.upload_list_lock.release()
 
         try:

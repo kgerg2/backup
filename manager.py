@@ -4,7 +4,7 @@ from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import Process
 from multiprocessing.connection import Listener
 from time import sleep
-from typing import Callable, List, Union
+from typing import Callable, List, Optional, Union
 
 from dateutil.relativedelta import relativedelta
 
@@ -25,7 +25,8 @@ class TimedTask:
                  max_delay: timedelta,
                  retry_time: Union[relativedelta, timedelta],
                  max_retry_count: int = 10,
-                 enabled: bool = True):
+                 enabled: bool = True,
+                 skip_if_running: bool = False):
         self.name = name
         self.task = task
         self.time = time
@@ -35,6 +36,9 @@ class TimedTask:
         self.retry_time = retry_time
         self.max_retry_count = max_retry_count
         self.enabled = enabled
+        self.skip_if_running = skip_if_running
+
+        self.process: Optional[Process] = None
 
     #     self.next_time = None
     #     self.process = None
@@ -63,19 +67,58 @@ class TimedTask:
     def check_if_ok_now(self, scheduled_time):
         return timedelta(0) <= datetime.now() - scheduled_time < self.max_delay
 
-message_server_process = None
 
+def message_server():
+    logging.debug("Üzenetfogadásért felelős folyamat elindul.")
+    
+    commands = {
+        "archive": 0,
+        "check_upload": 1,
+        "upload": sync_to_cloud,
+        "download": 2,
+        "trash": 3
+    }
+    listener = Listener(MESSAGE_LISTENER_ADDRESS, authkey=MESSAGE_LISTENER_AUTH_TOKEN)
 
-def check_message_server():
-    global message_server_process
+    while True:
+        conn = listener.accept()
+        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
+        while True:
+            try:
+                msg = conn.recv()
+            except EOFError:
+                break
 
-    logging.debug("Az üzenetek fogadásáért felelős folyamat futásának ellenőrzése.")
+            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
+            if msg in commands:
+                if isinstance(commands[msg], int):
+                    task = TASKS[commands[msg]]
+                    if task.process is None:
+                        logging.debug("Feladat indítása először: %s", task.name)
+                        task.process = Process(target=task.task)
+                        task.process.start()
 
-    if not message_server_process.is_alive():
-        logging.warning("Az üzenetek fogadásáért felelős folyamat nem fut, úrjaindításra kerül. "
-                        "Leállás hibakódja: %d", message_server_process.exitcode)
-        message_server_process = Process(target=message_server)
-        message_server_process.start()
+                    elif not task.process.is_alive():
+                        logging.debug("Feladat indítása: %s", task.name)
+                        task.process = Process(target=task.task)
+                        task.process.start()
+
+                        if task.skip_if_running:
+                            logging.warning("A %s futtatása megszakadt, most újraindításra "
+                                            "került.", task.name)
+                else:
+                    logging.debug("Feladat futtatása: %s", msg)
+                    Process(target=commands[msg]).start()
+            # if msg == 'close connection':
+            #     conn.close()
+            #     break
+            if msg == 'close server':
+                conn.close()
+                listener.close()
+                return
+
+    listener.close()
+
 
 TASKS = (
     TimedTask("archiválás",
@@ -86,12 +129,13 @@ TASKS = (
               timedelta(hours=4),
               timedelta(days=1)),
     TimedTask("feltöltés ellenőrzése",
-              check_sync,
+              sync_to_cloud,
               datetime(2000, 1, 1, 1, 0, 0),
               ["hour", "minute", "second"],
               timedelta(days=1),
               timedelta(hours=4),
-              timedelta(hours=1)),
+              timedelta(hours=1),
+              skip_if_running=True),
     TimedTask("letöltés",
               sync_from_cloud,
               datetime(2000, 1, 1, 23, 0, 0),
@@ -107,12 +151,13 @@ TASKS = (
               timedelta(hours=24),
               timedelta(days=1)),
     TimedTask("üzenetfogadás ellenőrzése",
-              check_message_server,
+              message_server,
               datetime(2000, 1, 1, 1, 0, 0),
               ["hour", "minute", "second"],
               timedelta(days=1),
               timedelta(hours=4),
-              timedelta(hours=1))
+              timedelta(hours=1),
+              skip_if_running=True)
 )
 
 
@@ -158,12 +203,19 @@ def start_main_loop() -> bool:
             continue
 
         if task.process is not None and task.process.is_alive():
-            task.next_time = task.get_next_retry(task.next_time)
-            logging.info("A(z) %s feladat előző futtatása még nem fejeződött be, "
-                         "ezért most nem indult el újra. Következő újrapróbálás ideje: %s",
-                         task.name, task.next_time.isoformat())
-            task.retry_count += 1
+            if task.skip_if_running:
+                task.next_time = task.get_next_scheduled()
+                task.retry_count = 0
+            else:
+                task.next_time = task.get_next_retry(task.next_time)
+                logging.info("A(z) %s feladat előző futtatása még nem fejeződött be, "
+                            "ezért most nem indult el újra. Következő újrapróbálás ideje: %s",
+                            task.name, task.next_time.isoformat())
+                task.retry_count += 1
             continue
+
+        if task.skip_if_running:
+            logging.warning("A(z) %s feladat futása megszakadt. Újraindítás most...", task.name)
 
         try:
             task.process = Process(target=task.task)
@@ -175,41 +227,6 @@ def start_main_loop() -> bool:
             raise
         else:
             task.next_time = task.get_next_scheduled()
-
-
-def message_server():
-    logging.debug("Üzenetfogadásért felelős folyamat elindul.")
-    
-    commands = {
-        "archive": archive,
-        "check_upload": check_sync,
-        "upload": sync_to_cloud,
-        "download": sync_from_cloud,
-        "trash": handle_trash
-    }
-    listener = Listener(MESSAGE_LISTENER_ADDRESS, authkey=MESSAGE_LISTENER_AUTH_TOKEN)
-
-    while True:
-        conn = listener.accept()
-        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
-        while True:
-            try:
-                msg = conn.recv()
-            except EOFError:
-                break
-
-            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
-            if msg in commands:
-                commands[msg]()
-            # if msg == 'close connection':
-            #     conn.close()
-            #     break
-            if msg == 'close server':
-                conn.close()
-                listener.close()
-                return
-
-    listener.close()
 
 
 def main():

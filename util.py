@@ -278,9 +278,9 @@ def extend_ignores(new: Iterable[Union[Path, str]]) -> bool:
                       "az új elemek hozzáadása sikertelen.")
         return False
 
-    if len(res) == len(ignores) and not new - set(res):
+    if len(res["ignore"]) == len(ignores) and not new - set(res["ignore"]):
         logging.debug("A nem szinkronizálandó fájlok adatbázisának frissítése megtörtént "
-                      "(összesen %d fájl).", len(res))
+                      "(összesen %d fájl).", len(res["ignore"]))
     else:
         logging.error("A nem szinkronizálandó fájlok adatbázisának frissítése sikertelen. "
                       "Válasz: %s", res)

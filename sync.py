@@ -7,8 +7,8 @@ import traceback
 from archiver import update_all_files
 
 import data_logger
-from config import (ALL_FILES, CLOUD_ONLY_FILES, LAST_SYNC_EVENT_FILE, LOCAL_FOLDER, REMOTE_FOLDER,
-                    UPLOADED_FILES)
+from config import (ALL_FILES, CLOUD_ONLY_FILES, DOWNLOADED_FILES, LAST_SYNC_EVENT_FILE,
+                    LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
 from uploader import Uploader
 from util import (extend_file_info, get_file_details, get_file_info, get_remote_mod_times,
                   get_syncthing, read_path_list, run_command, update_file_info,
@@ -24,9 +24,9 @@ last_sync_event = 0
 
 
 def check_sync():
-    global sync_process, last_sync_event
+    global sync_process
 
-    logging.debug("A szinkronizáló folyamat futásának ellenőrzése.")
+    logging.debug("A szinkronizáló (%s) folyamat futásának ellenőrzése.", sync_process)
 
     if sync_process is None:
         sync_process = Process(target=sync_to_cloud)
@@ -39,16 +39,30 @@ def check_sync():
         sync_process.start()
 
 
+def get_last_sync_event():
+    try:
+        with open(LAST_SYNC_EVENT_FILE, encoding="utf-8") as f:
+            found = int(f.read())
+    except:
+        return 0
+    
+    if found <= 0:
+        return 0
+
+    last_changes = get_change(last_event=found - 1, timeout=5)
+
+    if not last_changes:
+        return 0
+
+    return found
+
+
 def sync_to_cloud():
     global last_sync_event
 
     logging.debug("A bejövő módosítások figyelése indul.")
 
-    try:
-        with open(LAST_SYNC_EVENT_FILE, encoding="utf-8") as f:
-            last_sync_event = int(f.read())
-    except:
-        last_sync_event = 0
+    last_sync_event = get_last_sync_event()
 
     onedrive_uploader = Uploader(LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
     while True:
@@ -87,13 +101,6 @@ def sync_to_cloud():
                                     deleted)
             all_info.update(new_file_details)
             update_file_info(ALL_FILES, all_info)
-            with open(UPLOADED_FILES, encoding="utf-8") as f:
-                uploaded_files = set(f.read().splitlines())
-            uploaded_files = uploaded_files - set(deleted_files)
-            with open(UPLOADED_FILES, "w", encoding="utf-8") as f:
-                for file in uploaded_files:
-                    f.write(file)
-                    f.write("\n")
         else:
             extend_file_info(ALL_FILES, new_file_details)
 
@@ -142,8 +149,9 @@ def sync_from_cloud():
     if download_files:
         try:
             uploaded_files = set(read_path_list(UPLOADED_FILES))
+            downloaded_files = set(read_path_list(DOWNLOADED_FILES))
 
-            deletion_missed = download_files & uploaded_files
+            deletion_missed = download_files & (uploaded_files | downloaded_files)
             download_files = download_files - deletion_missed
 
             if deletion_missed:
@@ -155,14 +163,13 @@ def sync_from_cloud():
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
                 f.flush()
-                run_command(["rclone", "copy", REMOTE_FOLDER, LOCAL_FOLDER, "--files-from", f.name],
-                            error_message="Új fájlok letöltése sikertelen.", strict=False)
+                r = run_command(["rclone", "copy", REMOTE_FOLDER, LOCAL_FOLDER, "--files-from", f.name],
+                                error_message="Új fájlok letöltése sikertelen.", strict=False)
+
+            if r.returncode == 0:
+                with open(DOWNLOADED_FILES, "a+") as f:
+                    f.writelines(f"{file}\n" for file in download_files)
         except (FileNotFoundError, OSError) as e:
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s", traceback.format_exc())
 
-    if upload_files:
-        with NamedTemporaryFile(mode="w") as f:
-            f.write("\n".join(upload_files))
-            f.flush()
-            run_command(["rclone", "copy", LOCAL_FOLDER, REMOTE_FOLDER, "--files-from", f.name],
-                        error_message="Hiba történt az új fájlok feltöltése közben.", strict=False)
+    onedrive_uploader.upload(*upload_files)
