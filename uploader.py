@@ -5,8 +5,9 @@ from queue import Empty, Full, Queue
 from tempfile import NamedTemporaryFile
 from threading import Lock
 from typing import Union
+from config import CLOUD_ONLY_FILES
 
-from util import read_path_list, run_command
+from util import get_file_info, read_path_list, run_command
 
 
 class Uploader:
@@ -101,7 +102,7 @@ class Uploader:
         if r.returncode != 0:
             return
 
-        uploaded_files = set(read_path_list(self.upload_list_file))
+        uploaded_files = set(read_path_list(self.upload_list_file, default=[]))
 
         uploaded_files.discard(path)
 
@@ -111,13 +112,17 @@ class Uploader:
     def delete_folder(self, path):
         logging.debug("Mappa törlése (%s).", path)
 
+        if any(Path(file).is_relative_to(path) for file in get_file_info(CLOUD_ONLY_FILES)):
+            logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")
+            return
+
         r = run_command(["rclone", "purge", self.remote_folder.joinpath(path)],
                         error_message=f"Hiba történt a '{path}' mappa törlése közben.", strict=False)
 
         if r.returncode != 0:
             return
 
-        uploaded_files = set(read_path_list(self.upload_list_file))
+        uploaded_files = set(read_path_list(self.upload_list_file, default=[]))
 
         uploaded_files = {file for file in uploaded_files if not Path(file).is_relative_to(path)}
 

@@ -10,7 +10,7 @@ import data_logger
 from config import (ALL_FILES, CLOUD_ONLY_FILES, DOWNLOADED_FILES, LAST_SYNC_EVENT_FILE,
                     LOCAL_FOLDER, REMOTE_FOLDER, UPLOADED_FILES)
 from uploader import Uploader
-from util import (extend_file_info, get_file_details, get_file_info, get_remote_mod_times,
+from util import (discard_ignores, extend_file_info, get_file_details, get_file_info, get_remote_mod_times,
                   get_syncthing, read_path_list, run_command, update_file_info,
                   write_checkfile)
 
@@ -148,8 +148,8 @@ def sync_from_cloud():
 
     if download_files:
         try:
-            uploaded_files = set(read_path_list(UPLOADED_FILES))
-            downloaded_files = set(read_path_list(DOWNLOADED_FILES))
+            uploaded_files = set(read_path_list(UPLOADED_FILES, default=[]))
+            downloaded_files = set(read_path_list(DOWNLOADED_FILES, default=[]))
 
             deletion_missed = download_files & (uploaded_files | downloaded_files)
             download_files = download_files - deletion_missed
@@ -172,4 +172,6 @@ def sync_from_cloud():
         except (FileNotFoundError, OSError) as e:
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s", traceback.format_exc())
 
-    onedrive_uploader.upload(*upload_files)
+    if upload_files:
+        discard_ignores(upload_files)
+        onedrive_uploader.upload(*upload_files)

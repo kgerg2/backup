@@ -12,26 +12,30 @@ from zoneinfo import ZoneInfo
 from requests.exceptions import JSONDecodeError
 
 import data_logger
-from config import (ALL_FILES, ARCHIVE_FOLDER, CONFIG_DATA, FOLDER_ID,
-                    IGNORE_FILE, KEEP_AGE, LOCAL_FOLDER, REMOTE_FOLDER, TIMEZONE, TRASH_FOLDER)
-from util import (extend_file_info, extend_ignores, get_file_details,
+from config import (ALL_FILES, ARCHIVE_FOLDER, CONFIG_DATA, FOLDER_ID, IGNORE_FILE, KEEP_AGE,
+                    LOCAL_FOLDER, MOUNT_FOLDER, REMOTE_FOLDER, TIMEZONE, TRASH_FOLDER)
+from util import (discard_ignores, extend_file_info, extend_ignores, get_file_details,
                   get_file_info, get_syncthing, is_same_file, read_path_list,
                   run_command, update_file_info, write_checkfile)
 
 
-def get_files(folder: Path, ignores: Iterable[str]) -> Dict[Path, Tuple[datetime, int]]:
+def get_files(folder: Path, ignores: Iterable[str], return_directories: bool = True) -> \
+    Dict[Path, Tuple[datetime, int]]:
     logging.debug("A %s mappában található fájlok adatainak beolvasása.", folder)
     files = {}
 
     for path in folder.glob("**/*"):
         stat = path.stat()
         relative_path = path.relative_to(folder)
-        if not any(relative_path.is_relative_to(pattern) for pattern in ignores):
+        if (return_directories or path.is_file()) and \
+            not any(relative_path.is_relative_to(pattern) for pattern in ignores):
+
             files[relative_path] = (datetime.fromtimestamp(stat.st_mtime)
                                             .astimezone(TIMEZONE),
                                     stat.st_size)
 
     return files
+
 
 def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
                    files: List[Dict[str, Union[str, int, dict, list]]], added: Set[str],
@@ -50,20 +54,23 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
             added.add(path_str)
             continue
 
-        match = re.fullmatch(r"(\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d{6})?\d*(\+\d\d:\d\d)", file["modTime"])
+        match = re.fullmatch(r"(\d\d\d\d-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d*)?(\+\d\d:\d\d)",
+                             file["modTime"])
 
         if match is None:
             logging.error("Egy fájl módosítási ideje ismeretlen formátumú: %s (%s)",
                           file["modTime"], file["name"])
             removed.remove(path_str)
             continue
-        
+
         date_time, ms, timezone = match.groups()
         ms = ms or ".000000"
+        ms = (ms + "0"*6)[:7]
         timezone = timezone or "+02:00"
         iso_time = "".join((date_time, ms, timezone))
 
-        if not is_same_file((datetime.fromisoformat(iso_time), file["size"]), all_files[path_str]):
+        if file["type"] == "FILE_INFO_TYPE_FILE" and \
+            not is_same_file((datetime.fromisoformat(iso_time), file["size"]), all_files[path_str]):
             changed.add(path_str)
 
         try:
@@ -80,20 +87,17 @@ def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, da
         logging.warning("Nem található az összes fájl adatatát tartalmazó dokumentum (%s).",
                         ALL_FILES)
         known_files = {}
-    
-    toplevel = get_syncthing("db/browse", {"folder": FOLDER_ID, "levels": 1})
+
+    toplevel = get_syncthing("db/browse", {"folder": FOLDER_ID, "levels": 0})
 
     added = set()
     removed = set(known_files.keys())
     changed = set()
-    path = Path()
-
-    files = []
 
     for tl in toplevel:
         if tl["type"] == "FILE_INFO_TYPE_DIRECTORY":
-            path = path.joinpath(tl["name"])
-            files = get_syncthing("db/browse", {"folder": FOLDER_ID, "prefix": str(path)})
+            removed.discard(tl["name"])
+            files = get_syncthing("db/browse", {"folder": FOLDER_ID, "prefix": tl["name"]})
             validate_files(known_files, Path(tl["name"]), files, added, removed, changed)
         elif tl["type"] == "FILE_INFO_TYPE_FILE":
             validate_files(known_files, Path(), [tl], added, removed, changed)
@@ -101,7 +105,7 @@ def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, da
             logging.warning("Ismeretlen fájltípus a Syncthing adatbázisában: %s", tl)
             continue
 
-    exists = {file: get_file_details(LOCAL_FOLDER.joinpath(file)) for file in added | changed 
+    exists = {file: get_file_details(LOCAL_FOLDER.joinpath(file)) for file in added | changed
               if LOCAL_FOLDER.joinpath(file).exists()}
 
     known_files.update(exists)
@@ -110,7 +114,7 @@ def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, da
     for file in removed:
         resp = get_syncthing("db/file", {"folder": FOLDER_ID, "file": file}, expected_errors=(404,))
         if isinstance(resp, str) and "No such object in the index" in resp \
-            or resp["global"]["deleted"]:
+                or resp["global"]["deleted"] or resp["global"]["ignored"]:
             del known_files[file]
             did_remove = True
         else:
@@ -128,7 +132,7 @@ def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, da
                        in known_files.items() if hash is not None}
 
     return known_files
-        
+
 
 def eject(drive: str) -> None:
     logging.debug("%s eszköz kiadása.", drive)
@@ -150,7 +154,7 @@ def reconnect(drive: str) -> None:
 
     r = run_command(["findmnt", drive, "-J"],
                     error_message=f"A merevlemez ({drive}) csatlakozottsági állapotának lekérése "
-                    "sikertelen.", strict=False)
+                    "sikertelen.", expected_returncodes=(1,), strict=False)
     if r.returncode == 0 and r.stdout:
         try:
             response = json.loads(r.stdout)
@@ -164,6 +168,12 @@ def reconnect(drive: str) -> None:
 
     run_command(["sudo", "eject", "-t", drive],
                 error_message=f"A külső merevlemez ({drive}) csatlakoztatása sikertelen.")
+    if not Path(MOUNT_FOLDER).exists():
+        run_command(["sudo", "mkdir", MOUNT_FOLDER],
+                    error_message="A mount mappa létrehozása sikertelen.")
+        # Path(MOUNT_FOLDER).mkdir(exist_ok=True)
+    run_command(["sudo", "mount", drive, MOUNT_FOLDER],
+                error_message="A mount művelet sikertelen.")
 
 
 def archive(freeup_needed: int = 0) -> None:
@@ -188,6 +198,7 @@ def archive(freeup_needed: int = 0) -> None:
     finally:
         eject(archive_device)
 
+
 def sync_with_archive(freeup_needed: int = 0):
     with open(IGNORE_FILE, encoding="utf-8") as f:
         ignore_patterns = f.read().splitlines()
@@ -204,7 +215,7 @@ def sync_with_archive(freeup_needed: int = 0):
         not_archived_files_path = dir_path.joinpath("sync.txt")
         deleted_files_path = dir_path.joinpath("deleted.txt")
 
-        r = run_command(["rclone", "check", checkfile, ARCHIVE_FOLDER,
+        run_command(["rclone", "check", checkfile, ARCHIVE_FOLDER,
                      "--checkfile", "QuickXorHash",
                      "--differ", differing_files_path,
                      "--missing-on-dst", not_archived_files_path,
@@ -212,7 +223,6 @@ def sync_with_archive(freeup_needed: int = 0):
                     error_message="Az archiválandó fájlok meghatározása nem sikerült, "
                     "az összehasonlítás meghiúsult.", strict=False,
                     expected_returncodes=(1,))
-        print(r)
 
         copy_to_archive = read_path_list(differing_files_path, default=[])
 
@@ -222,6 +232,15 @@ def sync_with_archive(freeup_needed: int = 0):
 
     local_files = get_files(LOCAL_FOLDER, ignore_patterns)
 
+    not_matching_files = [file for file in copy_to_archive
+                          if Path(file) not in local_files or file not in global_files
+                          or not is_same_file(local_files[Path(file)], global_files[file])]
+
+    try:
+        discard_ignores(not_matching_files)
+    except ChildProcessError:
+        logging.error("Hiba történt a megváltozott fájlok újra figyelembevételekor.")
+
     delete_from_local = []
     freed_up_space = 0
 
@@ -229,9 +248,8 @@ def sync_with_archive(freeup_needed: int = 0):
         delete_from_local, freed_up_spaces = tuple(zip(*((file, size) for file, (time, size)
                                                    in local_files.items()
                                                    if datetime.now(TIMEZONE) - time > KEEP_AGE))) \
-                                             or ([], [0])
+            or ([], [0])
         freed_up_space = sum(freed_up_spaces)
-
 
     if freeup_needed < 0:
         logging.warning("A kért felszabadítandó tárhely mérete negatív (%d).", freeup_needed)
@@ -249,8 +267,9 @@ def sync_with_archive(freeup_needed: int = 0):
         else:
             logging.warning("Nem lehetséges elegendő tárhely felszabadítása. Kért mennyiség: %d, "
                             "teljesíthető: %d", freeup_needed, freed_up_space)
-            
-    data_logger.log(copy_to_archive=copy_to_archive, delete_from_archive=delete_from_archive, delete_from_local=delete_from_local)
+
+    data_logger.log(copy_to_archive=copy_to_archive,
+                    delete_from_archive=delete_from_archive, delete_from_local=delete_from_local)
     # Copy files to archive
 
     with NamedTemporaryFile(mode="w") as f:
@@ -286,7 +305,9 @@ def sync_with_archive(freeup_needed: int = 0):
                 delete_from_local = []
 
     if delete_from_local:
-        if not extend_ignores(delete_from_local):
+        try:
+            extend_ignores(delete_from_local)
+        except ChildProcessError:
             logging.error("A törlendő fájlok figyelmen kívül hagyása sikertelen, "
                           "a törlések nem fognak megtörténni.")
         else:

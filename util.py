@@ -1,5 +1,6 @@
 import csv
 import logging
+import re
 import shlex
 import subprocess
 from datetime import datetime, timedelta
@@ -12,7 +13,8 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple, Union
 import requests
 
 import data_logger
-from config import API_KEY, DEFAULT_HASHSUM, FOLDER_ID, REMOTE_FOLDER, SYNCTHING_RETRY_COUNT, SYNCTHING_RETRY_DELAY, TIME_FORMAT
+from config import (API_KEY, DEFAULT_HASHSUM, FOLDER_ID, REMOTE_FOLDER, SYNCTHING_RETRY_COUNT,
+                    SYNCTHING_RETRY_DELAY, TIME_FORMAT)
 
 
 class CSVDialect(csv.Dialect):
@@ -41,7 +43,7 @@ def read_csv(path: Union[Path, str]) -> Iterator[List]:
 
 
 def read_path_list(file: Union[Path, str], *, default: Any = None, strict: bool = True) \
-                   -> List[str]:
+        -> List[str]:
     try:
         with open(file, encoding="utf-8") as f:
             return f.read().splitlines()
@@ -50,21 +52,20 @@ def read_path_list(file: Union[Path, str], *, default: Any = None, strict: bool 
             logging.warning("A kért fájl (%s) beolvasása sikertelen. Alapértelmezett érték "
                             "használata: %s", file, default)
             return default
-        
+
         logging.error("A kért fájl (%s) beolvasása sikertelen.", file)
         raise
 
 
 def run_command(command: List[Union[str, Path]], error_message: str = "", strict: bool = True,
                 expected_returncodes: Iterable[int] = (), **kwargs) -> subprocess.CompletedProcess[bytes]:
-                
+
     logging.debug("Parancs futtatása: %s", shlex.join(map(str, command)))
 
     r = subprocess.run(list(map(str, command)), capture_output=True, **kwargs)
 
     if not error_message:
         error_message = f"A parancs ({command}) futtatása meghiúsult."
-
 
     if r.returncode and r.returncode not in expected_returncodes:
         if len(r.stdout) + len(r.stderr) > 200:
@@ -129,7 +130,7 @@ def get_file_details(path: Path) -> Tuple[str, datetime, int]:
                 hashsum = DEFAULT_HASHSUM
 
     stat = path.stat()
-        
+
     return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
 
 
@@ -172,17 +173,37 @@ def is_same_file(file1: Union[Tuple[str, datetime, int], Tuple[datetime, int]],
             return True
 
         if abs(date1 - date2) < timedelta(milliseconds=1):
-            logging.warning("Két fájlnak azonos a mérete, de a módosítási idejeik különbsége %s, "
-                            "ezért különbözőnek lesznek tekintve.", abs(date1 - date2))
+            logging.info("Két fájlnak azonos a mérete, de a módosítási idejeik különbsége %s, "
+                         "ezért különbözőnek lesznek tekintve.", abs(date1 - date2))
 
         return False
 
+
 def write_checkfile(path: Union[Path, str], data: Dict[str, Tuple[str, datetime, int]]) -> None:
     logging.debug("Rclone ellenőrzőfájl írása.")
-    data_logger.log("".join(f"{hash}  {name}\n" for name, (hash, _, _) in data.items()))
+    # data_logger.log("".join(f"{hash}  {name}\n" for name, (hash, _, _) in data.items()))
     with open(path, "w", encoding="utf-8") as f:
         f.writelines(f"{hash}  {name}\n" for name, (hash, _, _) in data.items())
 
+
+def get_remote_file_info(paths: Iterable[Union[Path, str]]) \
+                         -> Dict[str, Tuple[str, datetime, int]]:
+    logging.debug("Távoli fájlok adatainak összegyűjtése.")
+
+    result = get_remote_mod_times(paths)
+
+    with NamedTemporaryFile("w", encoding="utf-8") as f:
+        f.writelines(f"{path}\n" for path in paths)
+        f.flush()
+        r = run_command(["rclone", "hashsum", "quickxor", REMOTE_FOLDER, "--files-from", f.name],
+                        error_message="Nem sikerült a fájlok hashjének meghatározása.")
+
+    hashsums = {line[42:]: line[:40] for line in r.stdout.decode().splitlines()}
+    result = {file: (hashsums.get(file, DEFAULT_HASHSUM), date, size) for file, (date, size)
+                in result.items()}
+
+    return result
+        
 
 def get_remote_mod_times(paths: Iterable[Union[Path, str]]) -> Dict[str, Tuple[datetime, int]]:
     with NamedTemporaryFile("w", encoding="utf-8") as f:
@@ -192,9 +213,14 @@ def get_remote_mod_times(paths: Iterable[Union[Path, str]]) -> Dict[str, Tuple[d
                         error_message="Távoli fájlok módosítási idejeinek lekérése sikertelen.",
                         strict=False)
 
-        return {line[40:]: (datetime.strptime(line[10:36], "%Y-%m-%d %H:%M:%S.%f"), int(line[:9]))
-                for line in r.stdout.decode().splitlines()}
-        
+    def get_tuple(line):
+        match = re.fullmatch(r" *(\d+) (\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) (.*)", line)
+        size, date, file = match.groups()
+        date = (date + "0"*6)[:26]
+        return file, datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f"), size
+
+    return {file: (date, size) for file, date, size
+            in map(get_tuple, r.stdout.decode().splitlines())}
 
 
 def request_syncthing(method: Callable[..., requests.Response], req: str,
@@ -202,7 +228,8 @@ def request_syncthing(method: Callable[..., requests.Response], req: str,
     last_exception = None
     for _ in range(SYNCTHING_RETRY_COUNT):
         try:
-            r = method(f"http://localhost:8384/rest/{req}", headers={"X-API-Key": API_KEY}, **kwargs)
+            r = method(f"http://localhost:8384/rest/{req}",
+                       headers={"X-API-Key": API_KEY}, **kwargs)
             if r.status_code in expected_errors:
                 break
             r.raise_for_status()
@@ -234,7 +261,7 @@ def post_syncthing(req: str, data: Any, params: Dict[str, Any] = {},
                              expected_errors=expected_errors)
 
 
-def extend_ignores(new: Iterable[Union[Path, str]]) -> bool:
+def modify_ignores(modify: Callable[[Iterable[str]], Iterable[str]]) -> bool:
     for _ in range(SYNCTHING_RETRY_COUNT):
         try:
             res = get_syncthing("db/ignores", {"folder": FOLDER_ID})
@@ -251,12 +278,10 @@ def extend_ignores(new: Iterable[Union[Path, str]]) -> bool:
             logging.warning("A figyelmen kívül hagyott fájlok lekérdezése sikertelen, "
                             "újrapróbálás %d másodperc múlva.%s", SYNCTHING_RETRY_DELAY, res_text)
     else:
-        logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt, "
-                      "az új elemek hozzáadása sikertelen.")
+        logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt.")
         return False
 
-    new = {f"/{path}" if not (pathstr := str(path)).startswith("/") else pathstr for path in new}
-    ignores = set(res["ignore"]) | new
+    ignores = modify(res["ignore"])
 
     for _ in range(SYNCTHING_RETRY_COUNT):
         try:
@@ -274,14 +299,38 @@ def extend_ignores(new: Iterable[Union[Path, str]]) -> bool:
             logging.warning("A figyelmen kívül hagyott fájlok lekérdezése sikertelen, "
                             "újrapróbálás %d másodperc múlva.%s", SYNCTHING_RETRY_DELAY, res_text)
     else:
-        logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt, "
-                      "az új elemek hozzáadása sikertelen.")
+        logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt.")
         return False
 
-    if len(res["ignore"]) == len(ignores) and not new - set(res["ignore"]):
+    if set(res["ignore"]) == set(ignores):
         logging.debug("A nem szinkronizálandó fájlok adatbázisának frissítése megtörtént "
                       "(összesen %d fájl).", len(res["ignore"]))
     else:
         logging.error("A nem szinkronizálandó fájlok adatbázisának frissítése sikertelen. "
                       "Válasz: %s", res)
     return True
+
+
+def remove_parents_from_ignores() -> None:
+    def filter_leafs(paths):
+        paths = sorted(paths)
+        filtered = [p1 for p1, p2 in zip(paths, paths[1:] + [""]) if not p2.startswith(p1)]
+        return filtered
+
+    if not modify_ignores(filter_leafs):
+        raise ChildProcessError()
+
+
+def extend_ignores(new: Iterable[Union[Path, str]]) -> None:
+    new = {f"/{path}" if not (pathstr := str(path)).startswith("/") else pathstr for path in new}
+
+    if not modify_ignores(lambda ignores: set(ignores) | new):
+        raise ChildProcessError()
+
+
+def discard_ignores(files: Iterable[Union[Path, str]]) -> None:
+    files = {f"/{path}" if not (pathstr := str(path)).startswith("/") else pathstr
+             for path in files}
+
+    if not modify_ignores(lambda ignores: set(ignores) - files):
+        raise ChildProcessError()

@@ -234,7 +234,7 @@ def main():
 
     logging.basicConfig(format="%(asctime)s|%(levelname)s|%(filename)s:%(funcName)s(%(lineno)d)|%(message)s",
                         level=logging.DEBUG,
-                        handlers=(TimedRotatingFileHandler(LOGGING_FILE, atTime="midnight"),))
+                        handlers=(TimedRotatingFileHandler(LOGGING_FILE, when="midnight"),))
     
     logging.debug("Program indul.")
 

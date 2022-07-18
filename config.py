@@ -18,6 +18,7 @@ CLOUD_ONLY_FILES = METADATA_FOLDER.joinpath("cloud_only_files.txt")
 IGNORE_FILE = METADATA_FOLDER.joinpath("ignore_local.txt")
 LAST_SYNC_EVENT_FILE = METADATA_FOLDER.joinpath("last_sync_event.txt")
 
+MOUNT_FOLDER = "/media/kgerg/TOSHIBA EXT"
 CONFIG_DATA = METADATA_FOLDER.joinpath("config.json")
 LOGGING_FILE = Path("~/Shared/Syncthing-dev/logs.txt").expanduser()
 
