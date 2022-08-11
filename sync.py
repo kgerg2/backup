@@ -77,7 +77,7 @@ def sync_to_cloud():
                 if change["data"]["action"] == "deleted":
                     if change["data"]["type"] == "file":
                         onedrive_uploader.delete_file(relpath)
-                    elif change["data"]["type"] == "directory":
+                    elif change["data"]["type"] in ("directory", "dir"):
                         onedrive_uploader.delete_folder(relpath)
                     else:
                         logging.warning("Ismeretlen típusú törölt elem: %s", change["data"]["type"])
@@ -87,6 +87,9 @@ def sync_to_cloud():
                 else:
                     onedrive_uploader.upload(relpath)
                     new_files.append(relpath)
+            if change["type"] == "file" and change["data"]["action"] == "modified":
+                onedrive_uploader.upload(relpath)
+                new_files.append(relpath)
 
         new_file_details = {str(path): get_file_details(LOCAL_FOLDER.joinpath(path))
                             for path in new_files if LOCAL_FOLDER.joinpath(path).exists()}

@@ -221,7 +221,7 @@ def sync_with_archive(freeup_needed: int = 0):
                      "--missing-on-dst", not_archived_files_path,
                      "--missing-on-src", deleted_files_path],
                     error_message="Az archiválandó fájlok meghatározása nem sikerült, "
-                    "az összehasonlítás meghiúsult.", strict=False,
+                    "az összehasonlítás meghiúsult.", strict=True,
                     expected_returncodes=(1,))
 
         copy_to_archive = read_path_list(differing_files_path, default=[])

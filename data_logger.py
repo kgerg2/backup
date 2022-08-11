@@ -4,7 +4,7 @@ from multiprocessing import Process
 from pathlib import Path
 from threading import Lock, Thread
 
-log_folder = Path(".")
+log_folder = Path("./logs")
 file_creation_lock = Lock()
 
 def configure(log_path: Path):
