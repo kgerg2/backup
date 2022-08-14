@@ -4,7 +4,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from tempfile import NamedTemporaryFile
 from threading import Lock
-from typing import Union
+from typing import Iterable, List, Union
 from config import CLOUD_ONLY_FILES
 
 from util import get_file_info, read_path_list, run_command
@@ -129,10 +129,31 @@ class Uploader:
         with open(self.upload_list_file, "w") as f:
             f.write("\n".join(uploaded_files))
 
+    def check_files(self, file: str) -> bool:
+        if "_files/" in file or file.endswith("_files"):
+            return False
+
+        return True
+
+    def filter_uploads(self, files: Iterable[str]) -> Iterable[str]:
+        return filter(self.check_files, files)
+
     def upload(self, *files: Union[str, Path]) -> None:
         if not files:
             logging.warning("Feltöltés lett kezdeményezve, de nincs fájl megadva.")
             return
+
+        original_length = len(files)
+        files = list(self.filter_uploads(map(str, files)))
+
+        len_diff = original_length - len(files)
+        if len_diff:
+            if not files:
+                logging.debug("Az összes (%d) fájl el lett távolítva a feltöltendők közül, "
+                              "a feltöltés megszakítva.", len_diff)
+                return
+
+            logging.debug("%d fájl el lett távolítva a feltöltendők közül.", len_diff)
 
         if len(files) == 1:
             logging.debug("Fájl feltöltésre sorbaállítása (%s).", files[0])
@@ -140,7 +161,7 @@ class Uploader:
             logging.debug("Fájlok feltöltésre sorbaállítása (%s - %s)", files[0], files[-1])
 
         self.upload_list_lock.acquire()
-        self.files_to_upload.extend(map(str, files))
+        self.files_to_upload.extend(files)
         self.upload_list_lock.release()
 
         try:

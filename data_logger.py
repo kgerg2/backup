@@ -39,8 +39,13 @@ def log_dir(**kwargs):
         with open(folder.joinpath(f"{k}.log"), "a+", encoding="utf-8") as f:
             if isinstance(v, bytes):
                 f.write(v.decode())
+            elif isinstance(v, str):
+                f.write(v)
             else:
-                f.write(str(v))
+                try:
+                    f.write("\n".join(v))
+                except TypeError:
+                    f.write(str(v))
 
 def log_files(*args):
     # logging.debug("Fájlok írása: %s", args)
