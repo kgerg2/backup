@@ -45,6 +45,7 @@ def read_csv(path: Union[Path, str]) -> Iterator[List]:
 def read_path_list(file: Union[Path, str], *, default: Any = None, strict: bool = True) \
         -> List[str]:
     try:
+        logging.debug("Adatfájl beolvasása: %s", file)
         with open(file, encoding="utf-8") as f:
             return f.read().splitlines()
     except (FileNotFoundError, OSError):

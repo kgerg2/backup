@@ -7,6 +7,7 @@ from time import sleep
 from typing import Callable, List, Optional, Union
 
 from dateutil.relativedelta import relativedelta
+import multiprocessing_logging
 
 from archiver import archive
 from config import (FAILURE_EXPIRY_DAYS, LOGGING_FILE, MAX_FAILURES_PER_DAY,
@@ -236,6 +237,8 @@ def main():
                         level=logging.DEBUG,
                         handlers=(TimedRotatingFileHandler(LOGGING_FILE, when="midnight"),))
     
+    multiprocessing_logging.install_mp_handler()
+
     logging.debug("Program indul.")
 
     message_server_process = Process(target=message_server)
