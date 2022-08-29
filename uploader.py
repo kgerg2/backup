@@ -95,9 +95,12 @@ class Uploader:
     def delete_file(self, path):
         logging.debug("Fájl törlése (%s).", path)
         
-        r = run_command(["rclone", "deletefile", self.remote_folder.joinpath(path)],
-                        error_message=f"Hiba történt a '{path}' fájl törlése közben.",
-                        strict=False)
+        with NamedTemporaryFile("w", suffix=".txt") as f:
+            f.write(path)
+            f.flush()
+            r = run_command(["rclone", "delete", self.remote_folder, "--files-from", f.name],
+                            error_message=f"Hiba történt a '{path}' fájl törlése közben.",
+                            strict=False)
 
         if r.returncode != 0:
             return
