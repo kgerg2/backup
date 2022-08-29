@@ -7,6 +7,7 @@ from threading import Lock
 from typing import Iterable, List, Union
 from config import CLOUD_ONLY_FILES
 
+import data_logger
 from util import get_file_info, read_path_list, run_command
 
 
@@ -92,14 +93,19 @@ class Uploader:
 
         self.upload_lock.release()
 
-    def delete_file(self, path):
-        logging.debug("Fájl törlése (%s).", path)
+    def delete_file(self, path: Union[Path, str]) -> None:
+        self.delete_files([path])
+
+    def delete_files(self, paths: Iterable[Union[Path, str]]) -> None:
+        logging.debug("Fájlok törlése (%d db).", len(paths))
+        paths = list(map(str, paths))
+        data_logger.log(paths)
         
         with NamedTemporaryFile("w", suffix=".txt") as f:
-            f.write(path)
+            f.write("\n".join(paths))
             f.flush()
             r = run_command(["rclone", "delete", self.remote_folder, "--files-from", f.name],
-                            error_message=f"Hiba történt a '{path}' fájl törlése közben.",
+                            error_message=f"Hiba történt a fájlok törlése közben.",
                             strict=False)
 
         if r.returncode != 0:
@@ -107,7 +113,7 @@ class Uploader:
 
         uploaded_files = set(read_path_list(self.upload_list_file, default=[]))
 
-        uploaded_files.discard(path)
+        uploaded_files -= set(paths)
 
         with open(self.upload_list_file, "w") as f:
             f.write("\n".join(uploaded_files))

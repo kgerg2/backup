@@ -147,8 +147,6 @@ def sync_from_cloud():
         else:
             upload_files.append(file)
 
-    data_logger.log(bisync_files=bisync_files, upload_files=upload_files, download_files=download_files)
-
     if download_files:
         try:
             uploaded_files = set(read_path_list(UPLOADED_FILES, default=[]))
@@ -160,8 +158,7 @@ def sync_from_cloud():
             if deletion_missed:
                 logging.warning("%d fájl törlése elmaradt, pótlás most.", len(deletion_missed))
                 data_logger.log(deletion_missed)
-                for file in deletion_missed:
-                    onedrive_uploader.delete_file(file)
+                onedrive_uploader.delete_files(deletion_missed)
 
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
@@ -174,6 +171,8 @@ def sync_from_cloud():
                     f.writelines(f"{file}\n" for file in download_files)
         except (FileNotFoundError, OSError) as e:
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s", traceback.format_exc())
+
+    data_logger.log(bisync_files=bisync_files, upload_files=upload_files, download_files=download_files)
 
     if upload_files:
         discard_ignores(upload_files)
