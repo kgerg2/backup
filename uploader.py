@@ -1,181 +1,270 @@
 import logging
-from multiprocessing import Process
+from collections.abc import Iterable
+from multiprocessing import Queue  # pylint: disable=unused-import
 from pathlib import Path
-from queue import Empty, Full, Queue
+from queue import Empty
 from tempfile import NamedTemporaryFile
-from threading import Lock
-from typing import Iterable, List, Union
-from config import CLOUD_ONLY_FILES
+from traceback import format_exc
+from typing import Literal, NewType, NoReturn, Optional
+
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 import data_logger
-from util import get_file_info, read_path_list, run_command
+from config import AllFiles, FolderConfig
+from util import retry_on_error, run_command
+
+UploadAction = Literal["copy"] | Literal["move"]
+UploaderQueue = NewType("UploaderQueue",
+                        'Queue[tuple[Iterable[Path | str], UploadAction, FolderConfig]]')
 
 
 class Uploader:
+    """
+    Class responsible for performing file uploads. Only one should be used.
+    """
 
-    def __init__(self, local_folder: Path, remote_folder: Path, uploaded_list_file: Path):
-        self.upload_list_lock = Lock()
-        self.upload_lock = Lock()
-        self.upload_threads = Queue(2)
-        self.files_to_upload = []
-        self.local_folder = local_folder
-        self.remote_folder = remote_folder
-        self.upload_list_file = uploaded_list_file
+    ACTIONS = ("copy", "move")
+
+    def __init__(self, queue: UploaderQueue) -> None:
+        self.queue = queue
 
         logging.debug("Feltöltésért felelős osztály inicializálva.")
+        retry_on_error(self.listen,
+                       error_message="Hiba történt feltöltés közben és a folamat leállt.")
 
-    def get_command(self, command, path_to_list_of_files):
-        return ["rclone", command, "--files-from", path_to_list_of_files, self.local_folder, self.remote_folder]
+    def listen(self) -> NoReturn:
+        """
+        Gets a task from the queue and performs it.
+        """
 
-    def run_upload(self):
-        logging.debug("Új feltöltés kezdeményezve. Várakozás az előző befejeztére...")
-        self.upload_lock.acquire()
-
-        try:
-            with NamedTemporaryFile("w", suffix=".txt") as f:
-                self.upload_list_lock.acquire()
-                logging.debug("%d fájl feltöltése elkezdődik.", len(self.files_to_upload))
-                files_str = "\n".join(self.files_to_upload)
-                self.files_to_upload.clear()
-                self.upload_list_lock.release()
-
-                f.write(files_str)
-                f.flush()
-                res = run_command(self.get_command("copy", f.name) + ["-vv"],
-                                error_message="Hiba történt a fájlok feltöltése közben.",
-                                strict=False)
-
-            if res.returncode == 0:
-                logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                                files_str.count("\n") + 1,
-                                files_str[:files_str.find("\n")],
-                                files_str[files_str.rfind("\n")+1:])
-                with open(self.upload_list_file, "a+", encoding="utf-8") as f:
-                    f.write(files_str)
-                    f.write("\n")
-
+        while True:
+            args = self.queue.get()
             try:
-                self.upload_threads.get_nowait()
-            except Empty:
-                logging.warning("A feltöltő folyamatokat tartalmazó sorban nem található elem.")
+                self.upload(*args)
+            except:
+                logging.error("Feltöltés közben hiba történt. (Argumentumok: %s) %s", args,
+                              format_exc())
 
-            if self.upload_threads.empty() and self.files_to_upload:
-                logging.warning("Feltöltést végző folyamat nem várakozik, pedig vannak feltöltendő "
-                                "fájlok. Elindítása most megtörténik.")
-                try:
-                    thread = Process(target=self.run_upload)
-                    self.upload_threads.put_nowait(thread)
-                    thread.start()
-                except Full:
-                    pass
-        finally:
-            self.upload_lock.release()
+    def upload(self, paths: Iterable[Path | str], action: UploadAction, config: FolderConfig) \
+            -> None:
+        """
+        Runs the upload (copy or move) and sets the uploaded version date to the time of the
+        last modification.
+        """
 
-    def run_move(self, files):
-        logging.debug("Áthelyezés kezdeményezve a felhőtárhelyre. Várakozás...")
-        self.upload_lock.acquire()
+        paths = [str(path) for path in paths]
 
-        with open(self.upload_list_file, "a+", encoding="utf-8") as f:
-            f.write(files_str)
-            f.write("\n")
+        if not paths:
+            logging.warning("Feltöltés volt kezdeményezve, de feltöltendő fájlok nem kerültek "
+                            "megadásra.")
+            return
+
+        if len(paths) == 1:
+            logging.debug("'%s' feltöltése elkezdődik", paths[0])
+        else:
+            logging.debug("%d fájl feltöltése elkezdődik ('%s' - '%s')",
+                          len(paths), paths[0], paths[-1])
 
         with NamedTemporaryFile("w", suffix=".txt") as f:
-            files_str = "\n".join(files)
+            files_str = "\n".join(paths)
             f.write(files_str)
             f.flush()
-            res = run_command(self.get_command("move", f.name),
-                              error_message="Hiba történt a fájlok feltöltése, áthelyezése közben.",
-                              strict=False)
 
-        if res.returncode == 0:
-            logging.debug("Fájlok feltöltése sikeres (%d fájl, '%s' - '%s')",
-                            len(files), files[0], files[-1])
+            run_command(["rclone", action, "--files-from", f.name, config.local_folder,
+                         config.remote_folder], config.global_config,
+                        error_message="Hiba történt a fájlok feltöltése közben.")
 
-        self.upload_lock.release()
+        if len(paths) == 1:
+            logging.debug("'%s' feltöltése sikeres", paths[0])
+        else:
+            logging.debug("%d fájl feltöltése sikeres ('%s' - '%s')",
+                          len(paths), paths[0], paths[-1])
 
-    def delete_file(self, path: Union[Path, str]) -> None:
-        self.delete_files([path])
+        with Session(config.database) as session:
+            update_stmt = update(AllFiles).where(AllFiles.path.in_(paths)
+                                                 ).values(uploaded=AllFiles.modified)
+            logging.debug("SQL parancs futtatása: %s", update_stmt)
+            session.execute(update_stmt)
+            session.commit()
 
-    def delete_files(self, paths: Iterable[Union[Path, str]]) -> None:
+
+UploaderAction = UploadAction | Literal["delete_files"] | Literal["delete_folders"]
+FolderUploaderQueue = NewType(
+    "FolderUploaderQueue", "Queue[tuple[Iterable[Path | str], UploaderAction]]")
+
+
+class FolderUploader:
+    """
+    Class responsible for collections all the uploads needed for a folder and forwarding them to
+    the `Uploader` through the `uploader_queue`.
+    """
+
+    def __init__(self, config: FolderConfig,
+                 queue: FolderUploaderQueue,
+                 uploader_queue: UploaderQueue) -> None:
+        self.config = config
+        self.uploader_queue = uploader_queue
+        self.queue = queue
+
+        logging.debug("'%s' mappából '%s' mappába való feltöltésére felelős osztály "
+                      "inicializálva.", config.local_folder, config.remote_folder)
+        retry_on_error(self.listen,
+                       error_message="Hiba történt egy mappa feltöltéseinek kezelése közben.")
+
+    def listen(self) -> NoReturn:
+        """
+        Waits for a task to be placed into the queue and if it is in `Uploader.ACTIONS`, tries to
+        collect more of them by waiting at most 10 seconds.
+        Then performs the action with `self.perform_action`.
+
+        :return NoReturn: does not return
+        """
+
+        collect_files: list[Path | str] = []
+        collect_action: Optional[UploaderAction] = None
+
+        while True:
+            try:
+                files, action = self.queue.get(block=True, timeout=10)
+
+                if action == collect_action:
+                    collect_files.extend(files)
+                    continue
+
+                if collect_action is not None:
+                    self.perform_action(collect_action, collect_files)
+            except Empty:
+                if collect_action is not None:
+                    self.perform_action(collect_action, collect_files)
+
+                files, action = self.queue.get()
+
+            if action in Uploader.ACTIONS:
+                collect_action = action
+                collect_files = list(files)
+                continue
+
+            self.perform_action(action, files)
+            collect_action = None
+            collect_files.clear()
+
+    def perform_action(self, action: UploaderAction, files: Iterable[Path | str]) -> None:
+        """
+        If the action is a deletion, performs it directly. Otherwise forwards it with
+        `self.upload`.
+
+        :param UploaderAction action: the action to be performed (copy, move or deletion)
+        :param Iterable[Path | str] files: the files or folders
+        """
+
+        match action:
+            case "delete_files":
+                try:
+                    self.delete_files(files)
+                except:
+                    data_logger.log(self.config.global_config, failed_to_delete_files=files)
+                    logging.error("Hiba történt fájlok törlése közben: %s", format_exc())
+
+            case "delete_folders":
+                try:
+                    self.delete_folders(files)
+                except:
+                    data_logger.log(self.config.global_config, failed_to_delete_folders=files)
+                    logging.error("Hiba történt mappák törlése közben: %s", format_exc())
+
+            case _ if action in Uploader.ACTIONS:
+                self.upload(files, action)
+
+            case _:
+                logging.error("Hibás kérés fájlok feltöltésére: %s", action)
+
+    def upload(self, collect_files: Iterable[Path | str], action: UploadAction) -> None:
+        """
+        Filters out the unuploadable files with `self.check_file` and forwards the rest through
+        the `self.uploader_queue`.
+
+        :param Iterable[Path | str] collect_files: the files to be uploaded
+        :param UploadAction action: the upload action
+        """
+
+        filtered_files = filter(self.check_file, collect_files)
+        self.uploader_queue.put((filtered_files, action, self.config))
+
+    def delete_files(self, paths: Iterable[Path | str]) -> None:
+        """
+        Deletes files from the remote folder.
+
+        :param Iterable[Path | str] paths: the files to be deleted
+        """
+
+        paths = [str(path) for path in paths]
         logging.debug("Fájlok törlése (%d db).", len(paths))
-        paths = list(map(str, paths))
-        data_logger.log(paths)
-        
+        data_logger.log(self.config.global_config, paths)
+
         with NamedTemporaryFile("w", suffix=".txt") as f:
             f.write("\n".join(paths))
             f.flush()
-            r = run_command(["rclone", "delete", self.remote_folder, "--files-from", f.name],
-                            error_message=f"Hiba történt a fájlok törlése közben.",
-                            strict=False)
+            run_command(["rclone", "delete", self.config.remote_folder, "--files-from", f.name],
+                        self.config.global_config,
+                        error_message="Hiba történt a fájlok törlése közben.")
 
-        if r.returncode != 0:
-            return
+        # with Session(self.config.database) as session:
+        #     delete_stmt = delete(AllFiles).where(AllFiles.path.in_(paths))
+        #     logging.debug("SQL parancs futtatása: %s", delete_stmt)
+        #     session.execute(delete_stmt)
+        #     session.commit()
 
-        uploaded_files = set(read_path_list(self.upload_list_file, default=[]))
+    def delete_folders(self, paths: Iterable[Path | str]) -> None:
+        """
+        Deletes directories from the remote folder.
 
-        uploaded_files -= set(paths)
+        :param Iterable[Path | str] paths: the paths of the directories
+        """
 
-        with open(self.upload_list_file, "w") as f:
-            f.write("\n".join(uploaded_files))
+        for path in paths:
+            self.delete_folder(path)
 
-    def delete_folder(self, path):
-        logging.debug("Mappa törlése (%s).", path)
+    def delete_folder(self, path: Path | str) -> None:
+        """
+        Deletes a directory from the remote folder. The deletion will fail if any cloud only file
+        is inside that directcory.
 
-        if any(Path(file).is_relative_to(path) for file in get_file_info(CLOUD_ONLY_FILES)):
-            logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")
-            return
+        :param Path | str path: the directory to be deleted
+        """
 
-        r = run_command(["rclone", "purge", self.remote_folder.joinpath(path)],
-                        error_message=f"Hiba történt a '{path}' mappa törlése közben.", strict=False)
+        logging.debug("Mappa törlése: '%s'.", path)
 
-        if r.returncode != 0:
-            return
+        with Session(self.config.database) as session:
+            exists_stmt = select(AllFiles).where(AllFiles.is_relative_to(path)
+                                                 ).where(AllFiles.cloud_only).exists()
+            logging.debug("SQL parancs futtatása: %s", exists_stmt)
+            if session.query(exists_stmt).scalar():
+                logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")
+                return
 
-        uploaded_files = set(read_path_list(self.upload_list_file, default=[]))
+            run_command(["rclone", "purge", self.config.remote_folder.joinpath(path)],
+                        self.config.global_config,
+                        error_message=f"Hiba történt a '{path}' mappa törlése közben.",
+                        strict=False)
 
-        uploaded_files = {file for file in uploaded_files if not Path(file).is_relative_to(path)}
+            # delete_stmt = delete(AllFiles).where(AllFiles.is_relative_to(path))
+            # logging.debug("SQL parancs futtatása: %s", delete_stmt)
+            # session.execute(delete_stmt)
+            # session.commit()
 
-        with open(self.upload_list_file, "w") as f:
-            f.write("\n".join(uploaded_files))
+    @staticmethod
+    def check_file(file: str | Path) -> bool:
+        """
+        Decides whether a file can be uploaded or not.
 
-    def check_files(self, file: str) -> bool:
-        if "_files/" in file or file.endswith("_files"):
+        :param str | Path file: the path of the file
+        :return bool: whether the file can be uploaded
+        """
+
+        file_str = str(file)
+
+        if "_files/" in file_str or file_str.endswith("_files"):
             return False
 
         return True
-
-    def filter_uploads(self, files: Iterable[str]) -> Iterable[str]:
-        return filter(self.check_files, files)
-
-    def upload(self, *files: Union[str, Path]) -> None:
-        if not files:
-            logging.warning("Feltöltés lett kezdeményezve, de nincs fájl megadva.")
-            return
-
-        original_length = len(files)
-        files = list(self.filter_uploads(map(str, files)))
-
-        len_diff = original_length - len(files)
-        if len_diff:
-            if not files:
-                logging.debug("Az összes (%d) fájl el lett távolítva a feltöltendők közül, "
-                              "a feltöltés megszakítva.", len_diff)
-                return
-
-            logging.debug("%d fájl el lett távolítva a feltöltendők közül.", len_diff)
-
-        if len(files) == 1:
-            logging.debug("Fájl feltöltésre sorbaállítása (%s).", files[0])
-        else:
-            logging.debug("Fájlok feltöltésre sorbaállítása (%s - %s)", files[0], files[-1])
-
-        self.upload_list_lock.acquire()
-        self.files_to_upload.extend(files)
-        self.upload_list_lock.release()
-
-        try:
-            thread = Process(target=self.run_upload)
-            self.upload_threads.put_nowait(thread)
-            thread.start()
-        except Full:
-            pass

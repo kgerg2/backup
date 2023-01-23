@@ -1,19 +1,33 @@
 import logging
+from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
-from multiprocessing import Process
-from multiprocessing.connection import Listener
+from multiprocessing import Process, Queue
+from multiprocessing.connection import Connection, Listener
+from pathlib import Path
 from time import sleep
-from typing import Callable, List, Optional, Union
+from typing import Any, Iterable, Optional, TypedDict
 
-from dateutil.relativedelta import relativedelta
 import multiprocessing_logging
+from dateutil.relativedelta import relativedelta
 
 from archiver import archive
-from config import (FAILURE_EXPIRY_DAYS, LOGGING_FILE, MAX_FAILURES_PER_DAY,
-                    MAX_FAILURES_PER_HOUR, MESSAGE_LISTENER_ADDRESS, MESSAGE_LISTENER_AUTH_TOKEN)
-from sync import check_sync, sync_from_cloud, sync_to_cloud
+from change_listener import SyncthingChangeListener, SyncthingChanges
+from config import FolderConfig, GlobalConfig
+from sync import UploadSyncer, sync_from_cloud
 from trashhandler import handle_trash
+from uploader import (FolderUploader, FolderUploaderQueue, Uploader,
+                      UploaderQueue)
+from util import retry_on_error
+
+FolderProperties = TypedDict("FolderProperties", {
+    "config": FolderConfig,
+    "uploader_queue": FolderUploaderQueue,
+    "uploader_process": Process,
+    "folder_changes_queue": "Queue[SyncthingChanges]",
+    "upload_syncer_process": Process
+})
 
 
 class TimedTask:
@@ -21,15 +35,22 @@ class TimedTask:
                  name: str,
                  task: Callable,
                  time: datetime,
-                 time_fields: List[str],
-                 time_diff: Union[relativedelta, timedelta],
+                 time_fields: list[str],
+                 time_diff: relativedelta | timedelta,
                  max_delay: timedelta,
-                 retry_time: Union[relativedelta, timedelta],
+                 retry_time: relativedelta | timedelta,
+                 args: Sequence[Any] = (),
                  max_retry_count: int = 10,
                  enabled: bool = True,
-                 skip_if_running: bool = False):
+                 skip_if_running: bool = False,
+                 for_all_folders=False):
         self.name = name
-        self.task = task
+        if for_all_folders:
+            self.task = do_for_all_folders
+            self.args = [task] + list(args)
+        else:
+            self.task = task
+            self.args: list[Any] = list(args)
         self.time = time
         self.time_fields = time_fields
         self.time_diff = time_diff
@@ -38,27 +59,23 @@ class TimedTask:
         self.max_retry_count = max_retry_count
         self.enabled = enabled
         self.skip_if_running = skip_if_running
+        self.for_all_folders = for_all_folders
 
         self.process: Optional[Process] = None
-
-    #     self.next_time = None
-    #     self.process = None
-    #     self.retry_count = 0
-
-    # def reset_variables(self):
-    #     self.next_time = None
-    #     self.process = None
-    #     self.retry_count = 0
+        self.next_time: datetime = datetime.min
+        self.retry_count: int = 0
 
     def get_next_scheduled(self):
-        time = datetime.now().replace(**{field: getattr(self.time, field) for field in self.time_fields})
+        time = datetime.now().replace(**{field: getattr(self.time, field)
+                                         for field in self.time_fields})
         maxiter = 10
         while time < datetime.now() and maxiter > 0:
             maxiter -= 1
             time += self.time_diff
 
         if maxiter == 0:
-            logging.warning("A %s feladathoz megfelelő időpont meghatározása sikertelen. (érték: %s)", self.name, time)
+            logging.warning("A %s feladathoz megfelelő időpont meghatározása sikertelen. (érték: "
+                            "%s)", self.name, time)
 
         return time
 
@@ -69,56 +86,97 @@ class TimedTask:
         return timedelta(0) <= datetime.now() - scheduled_time < self.max_delay
 
 
-def message_server():
-    logging.debug("Üzenetfogadásért felelős folyamat elindul.")
-    
+def process_message(msg: Any, conn: Connection, config: GlobalConfig,
+                    folders: list[FolderProperties], uploader_queue: UploaderQueue,
+                    processes: dict[str, dict[str, Any]]):
+    def get_process_summary(process: Optional[Process]):
+        if process is None:
+            return "does not exist"
+
+        return {
+            "alive": process.is_alive(),
+            "exit_code": process.exitcode
+        }
+
     commands = {
         "archive": 0,
-        "check_upload": 1,
-        "upload": sync_to_cloud,
+        "check_processes": 1,
         "download": 2,
         "trash": 3
     }
-    listener = Listener(MESSAGE_LISTENER_ADDRESS, authkey=MESSAGE_LISTENER_AUTH_TOKEN)
 
-    while True:
-        conn = listener.accept()
-        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
-        while True:
+    match msg:
+        case ["get", "config"]:
+            conn.send(asdict(config))
+
+        case ["get", "folders"]:
+            conn.send([{
+                "config": folder["config"].get_summary(),
+                "folder_changes_queue_size": folder["folder_changes_queue"].qsize(),
+                "uploader_queue_size": folder["uploader_queue"].qsize(),
+                "uploader_process": get_process_summary(folder["uploader_process"]),
+                "upload_syncer_process": get_process_summary(folder["upload_syncer_process"])
+            } for folder in folders])
+
+        case ["get", "uploader"]:
+            conn.send({
+                "uploader_process": get_process_summary(processes["uploader"].get("process", None)),
+                "uploader_queue_size": uploader_queue.qsize()
+            })
+
+        case ["get", process] if process in processes:  # pylint: disable=used-before-assignment
+            conn.send(get_process_summary(processes[process].get("process", None)))
+
+        case ["start", process] if process in processes:
             try:
-                msg = conn.recv()
-            except EOFError:
-                break
+                start_process(processes[process])
+            except ValueError:
+                conn.send(f"{process} is running. Use restart to kill and start a new one.")
+            else:
+                conn.send("OK")
 
-            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
-            if msg in commands:
-                if isinstance(commands[msg], int):
-                    task = TASKS[commands[msg]]
-                    if task.process is None:
-                        logging.debug("Feladat indítása először: %s", task.name)
-                        task.process = Process(target=task.task)
-                        task.process.start()
+        case ["stop", process] if process in processes:
+            try:
+                stop_process(processes[process])
+            except ValueError as e:
+                conn.send(f"The process could not be stopped: {e}")
+            else:
+                conn.send("OK")
 
-                    elif not task.process.is_alive():
-                        logging.debug("Feladat indítása: %s", task.name)
-                        task.process = Process(target=task.task)
-                        task.process.start()
-
-                        if task.skip_if_running:
-                            logging.warning("A %s futtatása megszakadt, most újraindításra "
-                                            "került.", task.name)
-                else:
-                    logging.debug("Feladat futtatása: %s", msg)
-                    Process(target=commands[msg]).start()
-            # if msg == 'close connection':
-            #     conn.close()
-            #     break
-            if msg == 'close server':
-                conn.close()
-                listener.close()
+        case ["restart", process] if process in processes:
+            try:
+                stop_process(processes[process])
+            except ValueError as e:
+                conn.send(f"The process could not be stopped: {e}")
                 return
 
-    listener.close()
+            try:
+                retry_on_error(start_process, retry_delay=10,
+                               max_retry_count=12, args=[processes[process]])
+            except ValueError as e:
+                conn.send(f"The process could not be started: {e}")
+            else:
+                conn.send("OK")
+
+        case ["run", "check_processes"]:
+            check_processes(processes)
+
+        case ["run", task] if task in commands:  # pylint: disable=used-before-assignment
+            task_process = Process(target=TASKS[commands[task]].task,
+                                   args=TASKS[commands[task]].args)
+            task_process.run()
+
+
+def check_processes(processes: dict[str, dict[str, Any]]):
+    for name, spec in processes.items():
+        if "process" not in spec or not spec["process"].is_alive():
+            logging.warning("Egy folyamat nem fut, ezért újraindításra kerül: %s", name)
+            start_process(spec)
+
+
+def do_for_all_folders(task: Callable[[FolderProperties], None], folders: Iterable[FolderProperties]) -> None:
+    for folder in folders:
+        task(folder)
 
 
 TASKS = (
@@ -129,8 +187,8 @@ TASKS = (
               relativedelta(months=1),
               timedelta(hours=4),
               timedelta(days=1)),
-    TimedTask("feltöltés ellenőrzése",
-              sync_to_cloud,
+    TimedTask("folyamatok ellenőrzése",
+              check_processes,
               datetime(2000, 1, 1, 1, 0, 0),
               ["hour", "minute", "second"],
               timedelta(days=1),
@@ -151,28 +209,23 @@ TASKS = (
               relativedelta(months=1),
               timedelta(hours=24),
               timedelta(days=1)),
-    TimedTask("üzenetfogadás ellenőrzése",
-              message_server,
-              datetime(2000, 1, 1, 1, 0, 0),
-              ["hour", "minute", "second"],
-              timedelta(days=1),
-              timedelta(hours=4),
-              timedelta(hours=1),
-              skip_if_running=True)
 )
 
 
-def start_main_loop() -> bool:
+def start_main_loop(processes: dict[str, dict[str, Any]],
+                    folders: list[FolderProperties]):
     """
     Calls the tasks at the appropriate times.
-
-    :return bool: the program should continue
     """
 
     for task in TASKS:
         task.next_time = task.get_next_scheduled()
         task.process = None
         task.retry_count = 0
+        if task.task is check_processes:
+            task.args = [processes]
+        if task.for_all_folders and folders not in task.args:
+            task.args.append(folders)
 
     while True:
         task = min(TASKS, key=lambda x: x.next_time)
@@ -210,8 +263,8 @@ def start_main_loop() -> bool:
             else:
                 task.next_time = task.get_next_retry(task.next_time)
                 logging.info("A(z) %s feladat előző futtatása még nem fejeződött be, "
-                            "ezért most nem indult el újra. Következő újrapróbálás ideje: %s",
-                            task.name, task.next_time.isoformat())
+                             "ezért most nem indult el újra. Következő újrapróbálás ideje: %s",
+                             task.name, task.next_time.isoformat())
                 task.retry_count += 1
             continue
 
@@ -219,7 +272,7 @@ def start_main_loop() -> bool:
             logging.warning("A(z) %s feladat futása megszakadt. Újraindítás most...", task.name)
 
         try:
-            task.process = Process(target=task.task)
+            task.process = Process(target=task.task, args=task.args)
             logging.debug("Feladat indítása: %s", task.name)
             task.process.start()
         except:
@@ -230,47 +283,104 @@ def start_main_loop() -> bool:
             task.next_time = task.get_next_scheduled()
 
 
-def main():
-    global message_server_process
+def start_process(spec):
+    if "process" in spec and spec["process"].is_alive():
+        raise ValueError("Cannot start process, it is already running.")
 
-    logging.basicConfig(format="%(asctime)s|%(levelname)s|%(filename)s:%(funcName)s(%(lineno)d)|%(message)s",
-                        level=logging.DEBUG,
-                        handlers=(TimedRotatingFileHandler(LOGGING_FILE, when="midnight"),))
-    
+    spec.pop("process", None)
+    spec["process"] = Process(**spec)
+    spec["process"].run()
+
+
+def stop_process(spec):
+    if "process" not in spec:
+        raise ValueError("The process does not exist.")
+
+    if not spec["process"].is_alive():
+        raise ValueError("The process is not running.")
+
+    spec["process"].terminate()
+
+
+def main():
+    global_config = GlobalConfig.read_from_file("configs/global_config.json")
+
+    logging.basicConfig(
+        format="%(asctime)s|%(levelname)s|%(filename)s:%(funcName)s(%(lineno)d)|%(message)s",
+        level=logging.DEBUG,
+        handlers=(TimedRotatingFileHandler(global_config.logging_file, when="midnight"),))
+
     multiprocessing_logging.install_mp_handler()
 
     logging.debug("Program indul.")
 
-    message_server_process = Process(target=message_server)
-    message_server_process.start()
+    uploader_queue: UploaderQueue = Queue(maxsize=1000)  # type: ignore
 
-    end = False
-    failures = []
-    while not end:
-        try:
-            end = not start_main_loop()
-        except Exception as e:
-            logging.error("Hiba történt a program futása során: %s", e)
-            current_time = datetime.now()
+    processes = {
+        "uploader": {
+            "target": Uploader,
+            "args": [uploader_queue],
+        }
+    }
 
-            failures = [time for time in failures
-                        if current_time - time <= timedelta(days=FAILURE_EXPIRY_DAYS)]
+    start_process(processes["uploader"])
 
-            failures.append(current_time)
+    folders: list[FolderProperties] = []
+    for file in Path("configs/folder_configs").iterdir():
+        config = FolderConfig.read_from_file(file, global_config)
+        folder_uploader_queue: FolderUploaderQueue = Queue(maxsize=1000)  # type: ignore
+        uploader_process = Process(target=FolderUploader,
+                                   args=[config, folder_uploader_queue, uploader_queue])
+        uploader_process.run()
+        folder_changes_queue: "Queue[SyncthingChanges]" = Queue(maxsize=1000)
+        upload_syncer_process = Process(target=UploadSyncer,
+                                        args=[folder_changes_queue, uploader_queue, config])
+        upload_syncer_process.run()
 
-            if sum(1 for time in failures if current_time - time < timedelta(hours=1)) \
-                > MAX_FAILURES_PER_HOUR:
+        folders.append({
+            "config": config,
+            "uploader_queue": folder_uploader_queue,
+            "uploader_process": uploader_process,
+            "folder_changes_queue": folder_changes_queue,
+            "upload_syncer_process": upload_syncer_process
+        })
 
-                logging.error("Az utóbbi órában több, mint %d hiba történt, ezért az alkalmazás "
-                              "leáll.", MAX_FAILURES_PER_HOUR)
+    processes["change_listener"] = {
+        "target": SyncthingChangeListener,
+        "args": [[f["folder_changes_queue"] for f in folders]]
+    }
+    start_process(processes["change_listener"])
+
+    timed_tasks_process = Process(target=start_main_loop, args=[processes, folders])
+    timed_tasks_process.run()
+
+    return run_message_server(global_config, uploader_queue, processes, folders)
+
+
+def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueue,
+                       processes: dict[str, dict[str, Any]], folders: list[FolderProperties]):
+    logging.debug("Üzenetfogadás elindul.")
+
+    listener = Listener(global_config.message_listener_address,
+                        authkey=global_config.message_listener_auth_token)
+
+    while True:
+        conn = listener.accept()
+        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
+        while True:
+            try:
+                msg = conn.recv()
+            except EOFError:
                 break
 
-            if sum(1 for time in failures if current_time - time < timedelta(days=1)) \
-                > MAX_FAILURES_PER_DAY:
+            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
 
-                logging.error("Az utóbbi 24 órában több, mint %d hiba történt, ezért az "
-                              "alkalmazás leáll.", MAX_FAILURES_PER_DAY)
-                break
+            if msg == 'close server':
+                conn.close()
+                listener.close()
+                return
+
+            process_message(msg, conn, global_config, folders, uploader_queue, processes)
 
 
 if __name__ == "__main__":

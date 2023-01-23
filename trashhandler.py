@@ -1,7 +1,9 @@
-from config import TRASH_FOLDER, TRASH_KEEP_DAYS
+from manager import FolderProperties
 from util import run_command
 
 
-def handle_trash():
-    run_command(["rclone", "delete", TRASH_FOLDER, "--min-age", str(TRASH_KEEP_DAYS), "--rmdirs"],
+def handle_trash(folder_properties: FolderProperties) -> None:
+    config = folder_properties["config"]
+    run_command(["rclone", "delete", config.trash_folder, "--min-age", config.trash_keep_time,
+                "--rmdirs"], config.global_config,
                 error_message="A lomtárban lévő régi fájlok ürítése sikertelen.")

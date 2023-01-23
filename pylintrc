@@ -1,0 +1,6 @@
+[FORMAT]
+good-names=e,f,r
+
+[MESSAGES CONTROL]
+disable=bare-except,
+        missing-module-docstring

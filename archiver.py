@@ -2,44 +2,73 @@ import json
 import logging
 import re
 import traceback
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from subprocess import CalledProcessError
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import Dict, Iterable, List, Set, Tuple, Union
-from zoneinfo import ZoneInfo
 
 from requests.exceptions import JSONDecodeError
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 import data_logger
-from config import (ALL_FILES, ARCHIVE_FOLDER, CONFIG_DATA, FOLDER_ID, IGNORE_FILE, KEEP_AGE,
-                    LOCAL_FOLDER, MOUNT_FOLDER, REMOTE_FOLDER, TIMEZONE, TRASH_FOLDER)
-from util import (discard_ignores, extend_file_info, extend_ignores, get_file_details,
-                  get_file_info, get_syncthing, is_same_file, read_path_list,
-                  run_command, update_file_info, write_checkfile)
+from change_listener import SyncthingDbBrowseData
+from config import AllFiles, ArchiveConfig, FolderConfig, GlobalConfig, NoHash
+from manager import FolderProperties
+from util import (discard_ignores, extend_ignores, get_file_details,
+                  get_syncthing, is_same_file, read_path_list, run_command,
+                  write_checkfile)
 
 
-def get_files(folder: Path, ignores: Iterable[str], return_directories: bool = True) -> \
-    Dict[Path, Tuple[datetime, int]]:
-    logging.debug("A %s mappában található fájlok adatainak beolvasása.", folder)
+def get_files(config: FolderConfig, return_directories: bool = True) -> \
+        dict[Path, tuple[datetime, int]]:
+    """
+    Gets the last modification time and the size of all the files (and possibly dictionaries) in a
+    folder excluding those relative to `config.local_ignore_patterns`.
+
+    :param FolderConfig config: The folder configuration
+    :param bool return_directories: Whether to include directories, defaults to True
+    :return dict[Path, tuple[datetime, int]]: The mod. date and size of all the files relative to
+        the local folder.
+    """
+
+    logging.debug("A %s mappában található fájlok adatainak beolvasása.", config.local_folder)
     files = {}
 
-    for path in folder.glob("**/*"):
+    for path in config.local_folder.glob("**/*"):
         stat = path.stat()
-        relative_path = path.relative_to(folder)
+        relative_path = path.relative_to(config.local_folder)
+
         if (return_directories or path.is_file()) and \
-            not any(relative_path.is_relative_to(pattern) for pattern in ignores):
+                not any(relative_path.is_relative_to(pattern)
+                        for pattern in config.local_ignore_patterns):
 
             files[relative_path] = (datetime.fromtimestamp(stat.st_mtime)
-                                            .astimezone(TIMEZONE),
+                                            .astimezone(config.global_config.timezone),
                                     stat.st_size)
 
     return files
 
 
-def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
-                   files: List[Dict[str, Union[str, int, dict, list]]], added: Set[str],
-                   removed: Set[str], changed: Set[str]) -> None:
+def validate_files(all_files: dict[str, tuple[str, datetime, int]], path: Path,
+                   files: list[SyncthingDbBrowseData], added: set[str],
+                   removed: set[str], changed: set[str], config: FolderConfig) -> None:
+    """
+    Looks for any changes in the local folder relative to the state of `all_files`.
+
+    :param dict[str, tuple[str, datetime, int]] all_files: The currently known files (relative path
+        mapped to hash, last modification time and size).
+    :param Path path: The current folder path relative to the local folder.
+    :param list[SyncthingDbBrowseData] files: The contents of this folder according to Syncthing.
+    :param set[str] added: A set containing all the newly added files (previously not in
+        `all_files`).
+    :param set[str] removed: A set containing all the removed files. This gets emptied as all
+        the files get checked.
+    :param set[str] changed: A set containing all the changed files.
+    :param FolderConfig config: The configuration for the current folder.
+    """
+
     for file in files:
         if file["type"] not in ("FILE_INFO_TYPE_FILE", "FILE_INFO_TYPE_DIRECTORY"):
             logging.warning("Ismeretlen fájltípus a Syncthing adatbázisában: %s", file)
@@ -47,7 +76,7 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
 
         file_path = path.joinpath(file["name"])
         if file["type"] == "FILE_INFO_TYPE_DIRECTORY" and "children" in file:
-            validate_files(all_files, file_path, file["children"], added, removed, changed)
+            validate_files(all_files, file_path, file["children"], added, removed, changed, config)
 
         path_str = str(file_path)
         if path_str not in all_files:
@@ -64,13 +93,13 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
             continue
 
         date_time, ms, timezone = match.groups()
-        ms = ms or ".000000"
-        ms = (ms + "0"*6)[:7]
+        ms = ((ms or ".") + "0"*6)[:7]
         timezone = timezone or "+02:00"
         iso_time = "".join((date_time, ms, timezone))
 
         if file["type"] == "FILE_INFO_TYPE_FILE" and \
-            not is_same_file((datetime.fromisoformat(iso_time), file["size"]), all_files[path_str]):
+                not is_same_file((datetime.fromisoformat(iso_time), file["size"]),
+                                 all_files[path_str], config):
             changed.add(path_str)
 
         try:
@@ -80,52 +109,76 @@ def validate_files(all_files: Dict[str, Tuple[str, datetime, int]], path: Path,
                             " került.", path_str)
 
 
-def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, datetime, int]]:
-    try:
-        known_files = get_file_info(ALL_FILES)
-    except FileNotFoundError:
-        logging.warning("Nem található az összes fájl adatatát tartalmazó dokumentum (%s).",
-                        ALL_FILES)
-        known_files = {}
+def update_all_files(config: FolderConfig, return_directories: bool = True) \
+        -> dict[str, tuple[str, datetime, int]]:
+    """
+    Update the database with new / changed / removed files and return the current state.
 
-    toplevel = get_syncthing("db/browse", {"folder": FOLDER_ID, "levels": 0})
+    :param FolderConfig config: The folder configuration.
+    :param bool return_directories: Whether to return directories, defaults to True
+    :return dict[str, tuple[str, datetime, int]]: All the current files with hashsum, last
+        modification date and size.
+    """
 
-    added = set()
-    removed = set(known_files.keys())
-    changed = set()
+    with Session(config.database) as session:
+        select_stmt = select(AllFiles.path, AllFiles.hash, AllFiles.modified, AllFiles.size)
+        logging.debug("SQL parancs futtatása: %s", select_stmt)
+        known_files: dict[str, tuple[NoHash | str, datetime, int]] = \
+            {path: (h, d, m) for (path, h, d, m) in session.scalars(select_stmt)}
+
+    toplevel = get_syncthing("db/browse", config.global_config,
+                             {"folder": config.folder_id, "levels": 0})
+
+    added: set[str] = set()
+    removed: set[str] = set(known_files.keys())
+    changed: set[str] = set()
 
     for tl in toplevel:
         if tl["type"] == "FILE_INFO_TYPE_DIRECTORY":
             removed.discard(tl["name"])
-            files = get_syncthing("db/browse", {"folder": FOLDER_ID, "prefix": tl["name"]})
-            validate_files(known_files, Path(tl["name"]), files, added, removed, changed)
+            files = get_syncthing("db/browse", config.global_config,
+                                  {"folder": config.folder_id, "prefix": tl["name"]})
+            validate_files(known_files, Path(tl["name"]), files, added, removed, changed, config)
         elif tl["type"] == "FILE_INFO_TYPE_FILE":
-            validate_files(known_files, Path(), [tl], added, removed, changed)
+            validate_files(known_files, Path(), [tl], added, removed, changed, config)
         else:
             logging.warning("Ismeretlen fájltípus a Syncthing adatbázisában: %s", tl)
             continue
 
-    exists = {file: get_file_details(LOCAL_FOLDER.joinpath(file)) for file in added | changed
-              if LOCAL_FOLDER.joinpath(file).exists()}
+    exists = {file: get_file_details(config.local_folder.joinpath(file), config) for file
+              in added | changed if config.local_folder.joinpath(file).exists()}
 
     known_files.update(exists)
 
-    did_remove = False
+    paths_to_delete: list[str] = []
     for file in removed:
-        resp = get_syncthing("db/file", {"folder": FOLDER_ID, "file": file}, expected_errors=(404,))
+        resp = get_syncthing("db/file", config.global_config,
+                             {"folder": config.folder_id, "file": file}, expected_errors=(404,))
+
         if isinstance(resp, str) and "No such object in the index" in resp \
-                or resp["global"]["deleted"] or resp["global"]["ignored"]:
+                or (isinstance(resp, dict)
+                    and (resp["global"]["deleted"] or resp["global"]["ignored"])):
+
             del known_files[file]
-            did_remove = True
+            paths_to_delete.append(file)
+
         else:
             logging.warning("A '%s' fájl nem szerepelt a globálisak között, mégse látszik "
                             "töröltnek.", file)
-            data_logger.log(resp)
+            data_logger.log(config.global_config, resp)
 
-    if did_remove:
-        update_file_info(ALL_FILES, known_files)
-    elif exists:
-        extend_file_info(ALL_FILES, exists)
+    if paths_to_delete or exists:
+        with Session(config.database) as session:
+            if paths_to_delete:
+                delete_stmt = delete(AllFiles).where(AllFiles.path.in_(paths_to_delete))
+                logging.debug("SQL parancs futtatása: %s", delete_stmt)
+                session.execute(delete_stmt)
+
+            if exists:
+                session.add_all(AllFiles(path=path, size=s, hash=h, modified=m)
+                                for path, (h, m, s) in exists.items())
+
+            session.commit()
 
     if not return_directories:
         known_files = {file: (hash, mod_time, size) for file, (hash, mod_time, size)
@@ -134,92 +187,123 @@ def update_all_files(return_directories: bool = True) -> Dict[str, Tuple[str, da
     return known_files
 
 
-def eject(drive: str) -> None:
+def eject(archive_config: ArchiveConfig, global_config: GlobalConfig) -> None:
+    """
+    Eject an external drive.
+
+    :param ArchiveConfig archive_config: The archival configuration (contains the device).
+    :param GlobalConfig global_config: The global configuration.
+    """
+
+    drive = archive_config.archive_device
     logging.debug("%s eszköz kiadása.", drive)
 
     if drive is None:
         logging.warning("A biztonsági mentés nem távoli esztközre történik.")
         return
 
-    run_command(["sudo", "eject", drive],
+    run_command(["sudo", "eject", drive], global_config,
                 error_message=f"A külső merevlemez ({drive}) leválasztása sikertelen.")
 
 
-def reconnect(drive: str) -> None:
+def reconnect(archive_config: ArchiveConfig, global_config: GlobalConfig) -> None:
+    """
+    Reconnect an external drive (if it is not already connected).
+
+    :param ArchiveConfig archive_config: The archival configuration (contains the device).
+    :param GlobalConfig global_config: The global configuration.
+    """
+
+    drive = archive_config.archive_device
     logging.debug("%s eszköz csatlakoztatása.", drive)
 
-    if drive is None:
-        logging.warning("A biztonsági mentés nem távoli esztközre történik.")
-        return
-
-    r = run_command(["findmnt", drive, "-J"],
+    r = run_command(["findmnt", drive, "-J"], global_config,
                     error_message=f"A merevlemez ({drive}) csatlakozottsági állapotának lekérése "
                     "sikertelen.", expected_returncodes=(1,), strict=False)
     if r.returncode == 0 and r.stdout:
         try:
             response = json.loads(r.stdout)
-        except JSONDecodeError as e:
-            logging.warning(f"A merevlemez ({drive}) csatlakozottsági állapotának lekérése "
-                            "sikertelen. Az újracsatlakoztatás meg lesz kísérelve.")
+        except JSONDecodeError:
+            logging.warning("A merevlemez (%s) csatlakozottsági állapotának lekérése "
+                            "sikertelen. Az újracsatlakoztatás meg lesz kísérelve.", drive)
         else:
             if response["filesystems"]:
                 logging.warning("A külső merevlemez (%s) az már csatlakoztatva van.", drive)
                 return
 
-    run_command(["sudo", "eject", "-t", drive],
+    run_command(["sudo", "eject", "-t", drive], global_config,
                 error_message=f"A külső merevlemez ({drive}) csatlakoztatása sikertelen.")
-    if not Path(MOUNT_FOLDER).exists():
-        run_command(["sudo", "mkdir", MOUNT_FOLDER],
+    if not Path(archive_config.mount_folder).exists():
+        run_command(["sudo", "mkdir", archive_config.mount_folder], global_config,
                     error_message="A mount mappa létrehozása sikertelen.")
-        # Path(MOUNT_FOLDER).mkdir(exist_ok=True)
-    run_command(["sudo", "mount", drive, MOUNT_FOLDER],
+        # Path(archive_config.mount_folder).mkdir(exist_ok=True)
+    run_command(["sudo", "mount", drive, archive_config.mount_folder], global_config,
                 error_message="A mount művelet sikertelen.")
 
 
-def archive(freeup_needed: int = 0) -> None:
-    logging.info("Archválás...")
+def archive(folder_properties: FolderProperties, freeup_needed: int = 0) -> None:
+    """
+    Archive a folder to an external deviccec.
 
-    with open(CONFIG_DATA, encoding="utf-8") as f:
-        config = json.load(f)
+    :param FolderProperties folder_properties: The configuration for the folder.
+    :param int freeup_needed: The amount of space that needs to be freed by removing old files from
+        the local storage, defaults to 0
+    """
 
-    try:
-        archive_device = config["device"]
-    except KeyError:
-        logging.error("Az archiváláshoz szükséges eszköz nincs specifikálva, a konfigurációs fájl "
-                      "nem tartalmmaza a 'device' mezőt.")
+    config = folder_properties["config"]
+
+    if config.archive_config is None:
+        logging.warning("Archiválás volt kezdeményezve a %s mappára, de nincs eszköz megadva.",
+                        config.folder_id)
         return
 
-    reconnect(archive_device)
+    logging.info("Archválás...")
+
+    archive_config = config.archive_config
+
+    reconnect(archive_config, config.global_config)
 
     try:
-        sync_with_archive(freeup_needed)
-    except Exception as e:
+        sync_with_archive(config, freeup_needed)
+    except:
         logging.error("Hiba történt az archiválás során: %s", traceback.format_exc())
     finally:
-        eject(archive_device)
+        eject(archive_config, config.global_config)
 
 
-def sync_with_archive(freeup_needed: int = 0):
-    with open(IGNORE_FILE, encoding="utf-8") as f:
-        ignore_patterns = f.read().splitlines()
+def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
+    """
+    Archive a folder. Should only be called by `archiver.archive`.
 
-    global_files = update_all_files(return_directories=False)
+    :param FolderConfig config: The configuration for that folder.
+    :param int freeup_needed: The amount of space that needs to be freed, defaults to 0
+    """
+
+    if config.archive_config is None:
+        logging.warning("Archiválás volt kezdeményezve a %s mappára, de nincs megadva hozzá "
+                        "konfiguráció.", config.folder_id)
+        return
+
+    archive_config = config.archive_config
+
+    global_files = update_all_files(config, return_directories=False)
 
     with TemporaryDirectory() as tempdir:
         dir_path = Path(tempdir)
 
         checkfile = dir_path.joinpath("checkfile.txt")
-        write_checkfile(checkfile, global_files)
+        write_checkfile(checkfile, config)
 
         differing_files_path = dir_path.joinpath("differ.txt")
         not_archived_files_path = dir_path.joinpath("sync.txt")
         deleted_files_path = dir_path.joinpath("deleted.txt")
 
-        run_command(["rclone", "check", checkfile, ARCHIVE_FOLDER,
+        run_command(["rclone", "check", checkfile, archive_config.archive_folder,
                      "--checkfile", "QuickXorHash",
                      "--differ", differing_files_path,
                      "--missing-on-dst", not_archived_files_path,
                      "--missing-on-src", deleted_files_path],
+                    config.global_config,
                     error_message="Az archiválandó fájlok meghatározása nem sikerült, "
                     "az összehasonlítás meghiúsult.", strict=True,
                     expected_returncodes=(1,))
@@ -230,25 +314,27 @@ def sync_with_archive(freeup_needed: int = 0):
 
         delete_from_archive = read_path_list(deleted_files_path, default=[])
 
-    local_files = get_files(LOCAL_FOLDER, ignore_patterns)
+    local_files = get_files(config)
 
     not_matching_files = [file for file in copy_to_archive
                           if Path(file) not in local_files or file not in global_files
-                          or not is_same_file(local_files[Path(file)], global_files[file])]
+                          or not is_same_file(local_files[Path(file)], global_files[file], config)]
 
     try:
-        discard_ignores(not_matching_files)
+        discard_ignores(not_matching_files, config)
     except ChildProcessError:
         logging.error("Hiba történt a megváltozott fájlok újra figyelembevételekor.")
 
     delete_from_local = []
     freed_up_space = 0
 
-    if KEEP_AGE is not None:
-        delete_from_local, freed_up_spaces = tuple(zip(*((file, size) for file, (time, size)
-                                                   in local_files.items()
-                                                   if datetime.now(TIMEZONE) - time > KEEP_AGE))) \
-            or ([], [0])
+    if config.local_keep_time is not None:
+        t: tuple[Sequence[Path], Sequence[int]] = tuple(zip(*(
+            (file, size) for file, (time, size) in local_files.items()
+            if datetime.now(config.global_config.timezone) - time > config.local_keep_time
+        ))) or ([], [0])  # type: ignore
+
+        delete_from_local, freed_up_spaces = list(t[0]), t[1]
         freed_up_space = sum(freed_up_spaces)
 
     if freeup_needed < 0:
@@ -258,7 +344,8 @@ def sync_with_archive(freeup_needed: int = 0):
     if freeup_needed:
         freed_up_space = 0
 
-        for _, name, size in sorted((date, name, size) for name, (date, size) in local_files.items()):
+        for _, name, size in sorted((date, name, size)
+                                    for name, (date, size) in local_files.items()):
             delete_from_local.append(name)
             freed_up_space += size
 
@@ -268,14 +355,15 @@ def sync_with_archive(freeup_needed: int = 0):
             logging.warning("Nem lehetséges elegendő tárhely felszabadítása. Kért mennyiség: %d, "
                             "teljesíthető: %d", freeup_needed, freed_up_space)
 
-    data_logger.log(copy_to_archive=copy_to_archive,
+    data_logger.log(config.global_config, copy_to_archive=copy_to_archive,
                     delete_from_archive=delete_from_archive, delete_from_local=delete_from_local)
     # Copy files to archive
 
     with NamedTemporaryFile(mode="w") as f:
         f.write("\n".join(copy_to_archive))
         f.flush()
-        run_command(["rclone", "copy", "--files-from", f.name, LOCAL_FOLDER, ARCHIVE_FOLDER, "-vv"],
+        run_command(["rclone", "copy", "--files-from", f.name, config.local_folder,
+                     archive_config.archive_folder], config.global_config,
                     error_message="hiba történt az archiválás során.", strict=False)
 
     # Delete archived and synced files
@@ -285,8 +373,8 @@ def sync_with_archive(freeup_needed: int = 0):
             dir_path = Path(tempdir)
             missing = dir_path.joinpath("missing.txt")
             try:
-                run_command(["rclone", "check", LOCAL_FOLDER, REMOTE_FOLDER,
-                            "--missing-on-dst", missing],
+                run_command(["rclone", "check", config.local_folder, config.remote_folder,
+                            "--missing-on-dst", missing], config.global_config,
                             error_message="A törlendő lokális fájlok szinkronizáltságának "
                             "ellenőrzése sikertelen, a fájlok törlése kihagyára kerül.",
                             expected_returncodes=(1,))
@@ -296,9 +384,9 @@ def sync_with_archive(freeup_needed: int = 0):
                 if files:
                     logging.warning("Néhány fájl még nem került szinkronizálásra. "
                                     "Ezek törlése nem fog megtörténni.")
-                    data_logger.log(files)
+                    data_logger.log(config.global_config, files)
 
-                    delete_from_local = set(delete_from_local) - set(files)
+                    delete_from_local = set(map(str, delete_from_local)) - set(files)
             except (CalledProcessError, OSError, FileNotFoundError) as e:
                 logging.warning("A %s hiba miatt a fájlok törlése nem fog megtörténni.",
                                 e.__class__)
@@ -306,7 +394,7 @@ def sync_with_archive(freeup_needed: int = 0):
 
     if delete_from_local:
         try:
-            extend_ignores(delete_from_local)
+            extend_ignores(delete_from_local, config)
         except ChildProcessError:
             logging.error("A törlendő fájlok figyelmen kívül hagyása sikertelen, "
                           "a törlések nem fognak megtörténni.")
@@ -314,9 +402,10 @@ def sync_with_archive(freeup_needed: int = 0):
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(map(str, delete_from_local)))
                 f.flush()
-                run_command(["rclone", "move", "--files-from", f.name, LOCAL_FOLDER,
-                            ARCHIVE_FOLDER], error_message="A fájlok archívumba történő "
-                            "áthelyezése során hiba történt.", strict=False)
+                run_command(["rclone", "move", "--files-from", f.name, config.local_folder,
+                             archive_config.archive_folder], config.global_config,
+                            error_message="A fájlok archívumba történő áthelyezése során hiba "
+                            "történt.", strict=False)
 
     # Delete removed files from archive
 
@@ -324,6 +413,7 @@ def sync_with_archive(freeup_needed: int = 0):
         with NamedTemporaryFile(mode="w") as f:
             f.write("\n".join(delete_from_archive))
             f.flush()
-            run_command(["rclone", "move", "--files-from", f.name, ARCHIVE_FOLDER, TRASH_FOLDER],
+            run_command(["rclone", "move", "--files-from", f.name, archive_config.archive_folder,
+                         config.trash_folder], config.global_config,
                         error_message="Hiba történt a törölt fájlok archívumból kukába helyezése "
                         "közben.", strict=False)
