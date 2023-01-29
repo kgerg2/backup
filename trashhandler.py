@@ -1,4 +1,4 @@
-from manager import FolderProperties
+from config import FolderProperties
 from util import run_command
 
 

@@ -2,7 +2,6 @@ from abc import abstractmethod
 from collections.abc import Sequence
 import logging
 from multiprocessing import Queue
-from pathlib import Path
 from typing import Generic, Literal, NewType, NoReturn, Optional, TypeVar, TypedDict
 from typing_extensions import override
 from config import GlobalConfig
@@ -18,7 +17,7 @@ class ChangeListener(Generic[T]):
     of the provided queues.
     """
 
-    def __init__(self, queues: Sequence[Queue[T]], error_message: Optional[str] = None) -> None:
+    def __init__(self, queues: "Sequence[Queue[T]]", error_message: Optional[str] = None) -> None:
         self.queues = queues
 
         retry_on_error(self.listen, error_message=error_message)
@@ -104,10 +103,10 @@ class SyncthingChangeListener(ChangeListener[SyncthingChanges]):
     """
 
     def __init__(self, config: GlobalConfig, queues: "Sequence[Queue[SyncthingChanges]]",
-                 last_event_file: Path | str, last_event: Optional[int] = None, timeout=3600) \
+                 last_event: Optional[int] = None, timeout=3600) \
             -> None:
         self.config: GlobalConfig = config
-        self.last_event_file = last_event_file
+        self.last_event_file = config.last_event_file
         if last_event is None:
             last_event = self.get_last_event()
         self.last_event = last_event
@@ -148,13 +147,14 @@ class SyncthingChangeListener(ChangeListener[SyncthingChanges]):
             => `self.timeout`
         :return SyncthingChanges: returned value from Syncthing
         """
-
         if last_event is None:
             last_event = self.last_event
         if timeout is None:
             timeout = self.timeout
 
-        return get_syncthing("events/disk", self.config, {"since": last_event, "timeout": timeout})
+        res =  get_syncthing("events/disk", self.config, {"since": last_event, "timeout": timeout})
+        logging.debug("Válasz: %s", res)
+        return res
 
     def get_last_event(self) -> int:
         """

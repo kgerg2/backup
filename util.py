@@ -127,7 +127,7 @@ def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, da
     if path.is_dir():
         hashsum = config.global_config.default_hashsum
     else:
-        r = run_command(["rclone", "hashsum", "quickxor", str(path)], config.global_config,
+        r = run_command(["rclone", "hashsum", "quickxor", config.local_folder.joinpath(path)], config.global_config,
                         error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
                         strict=False)
         if r.returncode:
@@ -139,7 +139,7 @@ def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, da
                 logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
                 hashsum = config.global_config.default_hashsum
 
-    stat = path.stat()
+    stat = config.local_folder.joinpath(path).stat()
 
     return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
 
@@ -194,14 +194,12 @@ def is_same_file(file1: tuple[str, datetime, int] | tuple[datetime, int],
 
 def write_checkfile(path: Path | str, config: FolderConfig) -> None:
     logging.debug("Rclone ellenőrzőfájl írása.")
-    # data_logger.log("".join(f"{hash}  {name}\n" for name, (hash, _, _) in data.items()))
     with Session(config.database) as session:
-        select_stmt = select(AllFiles.path, AllFiles.hash).where(AllFiles.hash.is_not(None))
+        select_stmt = select(AllFiles).where(AllFiles.hash.is_not(None))
         logging.debug("SQL parancs futtatása: %s", select_stmt)
         data = session.scalars(select_stmt)
-
         with open(path, "w", encoding="utf-8") as f:
-            f.writelines(f"{hash}  {name}\n" for name, hash in data)
+            f.writelines(f"{r.hash}  {r.path}\n" for r in data)
 
 
 def get_remote_file_info(paths: Iterable[Path | str], config: FolderConfig) \
@@ -314,6 +312,9 @@ def modify_ignores(modify: Callable[[Iterable[str]], Iterable[str]], config: Fol
         logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt.")
         return False
 
+    if res["ignore"] is None:
+        res["ignore"] = []
+
     ignores = modify(res["ignore"])
 
     for _ in range(config.global_config.syncthing_retry_count):
@@ -336,6 +337,9 @@ def modify_ignores(modify: Callable[[Iterable[str]], Iterable[str]], config: Fol
     else:
         logging.error("A figyelmen kívül hagyott fájlok lekérdezése során túl sok hiba történt.")
         return False
+
+    if res["ignore"] is None:
+        res["ignore"] = []
 
     if set(res["ignore"]) == set(ignores):
         logging.debug("A nem szinkronizálandó fájlok adatbázisának frissítése megtörtént "

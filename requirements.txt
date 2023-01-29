@@ -1,3 +1,4 @@
 python-dateutil
 typing-extensions
 multiprocessing-logging
+SQLAlchemy>=2.0.0

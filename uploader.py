@@ -5,18 +5,15 @@ from pathlib import Path
 from queue import Empty
 from tempfile import NamedTemporaryFile
 from traceback import format_exc
-from typing import Literal, NewType, NoReturn, Optional
+from typing import NoReturn, Optional
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 import data_logger
-from config import AllFiles, FolderConfig
+from config import (AllFiles, FolderConfig, FolderUploaderQueue, GlobalConfig,
+                    UploadAction, UploaderAction, UploaderQueue)
 from util import retry_on_error, run_command
-
-UploadAction = Literal["copy"] | Literal["move"]
-UploaderQueue = NewType("UploaderQueue",
-                        'Queue[tuple[Iterable[Path | str], UploadAction, FolderConfig]]')
 
 
 class Uploader:
@@ -26,8 +23,9 @@ class Uploader:
 
     ACTIONS = ("copy", "move")
 
-    def __init__(self, queue: UploaderQueue) -> None:
+    def __init__(self, global_config: GlobalConfig, queue: UploaderQueue) -> None:
         self.queue = queue
+        self.global_config = global_config
 
         logging.debug("Feltöltésért felelős osztály inicializálva.")
         retry_on_error(self.listen,
@@ -46,7 +44,7 @@ class Uploader:
                 logging.error("Feltöltés közben hiba történt. (Argumentumok: %s) %s", args,
                               format_exc())
 
-    def upload(self, paths: Iterable[Path | str], action: UploadAction, config: FolderConfig) \
+    def upload(self, paths: Iterable[Path | str], action: UploadAction, local_folder: Path | str, remote_folder: Path | str) \
             -> None:
         """
         Runs the upload (copy or move) and sets the uploaded version date to the time of the
@@ -71,8 +69,8 @@ class Uploader:
             f.write(files_str)
             f.flush()
 
-            run_command(["rclone", action, "--files-from", f.name, config.local_folder,
-                         config.remote_folder], config.global_config,
+            run_command(["rclone", action, "--files-from", f.name, local_folder,
+                         remote_folder], self.global_config,
                         error_message="Hiba történt a fájlok feltöltése közben.")
 
         if len(paths) == 1:
@@ -81,17 +79,7 @@ class Uploader:
             logging.debug("%d fájl feltöltése sikeres ('%s' - '%s')",
                           len(paths), paths[0], paths[-1])
 
-        with Session(config.database) as session:
-            update_stmt = update(AllFiles).where(AllFiles.path.in_(paths)
-                                                 ).values(uploaded=AllFiles.modified)
-            logging.debug("SQL parancs futtatása: %s", update_stmt)
-            session.execute(update_stmt)
-            session.commit()
 
-
-UploaderAction = UploadAction | Literal["delete_files"] | Literal["delete_folders"]
-FolderUploaderQueue = NewType(
-    "FolderUploaderQueue", "Queue[tuple[Iterable[Path | str], UploaderAction]]")
 
 
 class FolderUploader:
@@ -187,9 +175,18 @@ class FolderUploader:
         :param Iterable[Path | str] collect_files: the files to be uploaded
         :param UploadAction action: the upload action
         """
-
+        logging.debug("Feltöltendő fájlok szűrés előtt: %s", collect_files)
         filtered_files = filter(self.check_file, collect_files)
-        self.uploader_queue.put((filtered_files, action, self.config))
+        self.uploader_queue.put((filtered_files, action, self.config.local_folder,
+                                 self.config.remote_folder))
+
+        with Session(self.config.database) as session:
+            update_stmt = update(AllFiles) \
+                                  .where(AllFiles.path.in_([str(f) for f in filtered_files])) \
+                                  .values(uploaded=AllFiles.modified)
+            logging.debug("SQL parancs futtatása: %s", update_stmt)
+            session.execute(update_stmt)
+            session.commit()
 
     def delete_files(self, paths: Iterable[Path | str]) -> None:
         """
@@ -236,7 +233,7 @@ class FolderUploader:
         logging.debug("Mappa törlése: '%s'.", path)
 
         with Session(self.config.database) as session:
-            exists_stmt = select(AllFiles).where(AllFiles.is_relative_to(path)
+            exists_stmt = select(AllFiles).where(AllFiles.is_relative_to(str(path))
                                                  ).where(AllFiles.cloud_only).exists()
             logging.debug("SQL parancs futtatása: %s", exists_stmt)
             if session.query(exists_stmt).scalar():

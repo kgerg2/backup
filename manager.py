@@ -7,27 +7,18 @@ from multiprocessing import Process, Queue
 from multiprocessing.connection import Connection, Listener
 from pathlib import Path
 from time import sleep
-from typing import Any, Iterable, Optional, TypedDict
+from typing import Any, Iterable, Optional
 
 import multiprocessing_logging
 from dateutil.relativedelta import relativedelta
 
 from archiver import archive
 from change_listener import SyncthingChangeListener, SyncthingChanges
-from config import FolderConfig, GlobalConfig
+from config import FolderConfig, GlobalConfig, FolderProperties, FolderUploaderQueue, UploaderQueue
 from sync import UploadSyncer, sync_from_cloud
 from trashhandler import handle_trash
-from uploader import (FolderUploader, FolderUploaderQueue, Uploader,
-                      UploaderQueue)
+from uploader import FolderUploader, Uploader
 from util import retry_on_error
-
-FolderProperties = TypedDict("FolderProperties", {
-    "config": FolderConfig,
-    "uploader_queue": FolderUploaderQueue,
-    "uploader_process": Process,
-    "folder_changes_queue": "Queue[SyncthingChanges]",
-    "upload_syncer_process": Process
-})
 
 
 class TimedTask:
@@ -162,9 +153,15 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             check_processes(processes)
 
         case ["run", task] if task in commands:  # pylint: disable=used-before-assignment
-            task_process = Process(target=TASKS[commands[task]].task,
-                                   args=TASKS[commands[task]].args)
-            task_process.run()
+            task = TASKS[commands[task]]
+            if task.task is check_processes:
+                task.args = [processes]
+            if task.for_all_folders and folders not in task.args:
+                task.args.append(folders)
+
+            task_process = Process(target=task.task,
+                                   args=task.args)
+            task_process.start()
 
 
 def check_processes(processes: dict[str, dict[str, Any]]):
@@ -186,7 +183,8 @@ TASKS = (
               ["day", "hour", "minute", "second"],
               relativedelta(months=1),
               timedelta(hours=4),
-              timedelta(days=1)),
+              timedelta(days=1),
+              for_all_folders=True),
     TimedTask("folyamatok ellenőrzése",
               check_processes,
               datetime(2000, 1, 1, 1, 0, 0),
@@ -201,14 +199,16 @@ TASKS = (
               ["hour", "minute", "second"],
               timedelta(days=1),
               timedelta(hours=2),
-              timedelta(hours=1)),
+              timedelta(hours=1),
+              for_all_folders=True),
     TimedTask("lomtalanítás",
               handle_trash,
               datetime(2000, 1, 5, 10, 0, 0),
               ["day", "hour", "minute", "second"],
               relativedelta(months=1),
               timedelta(hours=24),
-              timedelta(days=1)),
+              timedelta(days=1),
+              for_all_folders=True),
 )
 
 
@@ -289,7 +289,7 @@ def start_process(spec):
 
     spec.pop("process", None)
     spec["process"] = Process(**spec)
-    spec["process"].run()
+    spec["process"].start()
 
 
 def stop_process(spec):
@@ -303,8 +303,9 @@ def stop_process(spec):
 
 
 def main():
-    global_config = GlobalConfig.read_from_file("configs/global_config.json")
+    global_config = GlobalConfig.read_from_file("test-configs/global_config.json")
 
+    global_config.logging_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         format="%(asctime)s|%(levelname)s|%(filename)s:%(funcName)s(%(lineno)d)|%(message)s",
         level=logging.DEBUG,
@@ -319,23 +320,23 @@ def main():
     processes = {
         "uploader": {
             "target": Uploader,
-            "args": [uploader_queue],
+            "args": [global_config, uploader_queue],
         }
     }
 
     start_process(processes["uploader"])
 
     folders: list[FolderProperties] = []
-    for file in Path("configs/folder_configs").iterdir():
+    for file in Path("test-configs/folder-configs").iterdir():
         config = FolderConfig.read_from_file(file, global_config)
         folder_uploader_queue: FolderUploaderQueue = Queue(maxsize=1000)  # type: ignore
         uploader_process = Process(target=FolderUploader,
                                    args=[config, folder_uploader_queue, uploader_queue])
-        uploader_process.run()
+        uploader_process.start()
         folder_changes_queue: "Queue[SyncthingChanges]" = Queue(maxsize=1000)
         upload_syncer_process = Process(target=UploadSyncer,
-                                        args=[folder_changes_queue, uploader_queue, config])
-        upload_syncer_process.run()
+                                        args=[folder_changes_queue, folder_uploader_queue, config])
+        upload_syncer_process.start()
 
         folders.append({
             "config": config,
@@ -347,15 +348,16 @@ def main():
 
     processes["change_listener"] = {
         "target": SyncthingChangeListener,
-        "args": [[f["folder_changes_queue"] for f in folders]]
+        "args": [global_config, [f["folder_changes_queue"] for f in folders]]
     }
     start_process(processes["change_listener"])
 
     timed_tasks_process = Process(target=start_main_loop, args=[processes, folders])
-    timed_tasks_process.run()
+    timed_tasks_process.start()
 
-    return run_message_server(global_config, uploader_queue, processes, folders)
-
+    return retry_on_error(run_message_server,
+                          args=(global_config, uploader_queue, processes, folders),
+                          error_message="Az üzenetfogadás során hiba történt.")
 
 def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueue,
                        processes: dict[str, dict[str, Any]], folders: list[FolderProperties]):
@@ -365,23 +367,25 @@ def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueu
                         authkey=global_config.message_listener_auth_token)
 
     while True:
-        conn = listener.accept()
-        logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
-        while True:
-            try:
-                msg = conn.recv()
-            except EOFError:
-                break
+        try:
+            conn = listener.accept()
+            logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
+            while True:
+                try:
+                    msg = conn.recv()
+                except EOFError:
+                    break
 
-            logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
+                logging.debug("Üzenet %s-tól: %s", listener.last_accepted, msg)
 
-            if msg == 'close server':
-                conn.close()
-                listener.close()
-                return
+                if msg == 'close server':
+                    conn.close()
+                    listener.close()
+                    return
 
-            process_message(msg, conn, global_config, folders, uploader_queue, processes)
-
+                process_message(msg, conn, global_config, folders, uploader_queue, processes)
+        except EOFError:
+            logging.warning("Hibás fogadott üzenet.")
 
 if __name__ == "__main__":
     main()

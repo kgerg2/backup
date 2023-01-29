@@ -1,7 +1,11 @@
 __pycache__
+.vscode
 .stfolder
 .stignore
 .stversions
 
 *.log
+*.sqlite
 logs*
+test*
+Test*

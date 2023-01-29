@@ -14,8 +14,7 @@ from sqlalchemy.orm import Session
 
 import data_logger
 from change_listener import SyncthingDbBrowseData
-from config import AllFiles, ArchiveConfig, FolderConfig, GlobalConfig, NoHash
-from manager import FolderProperties
+from config import AllFiles, ArchiveConfig, FolderConfig, GlobalConfig, NoHash, FolderProperties
 from util import (discard_ignores, extend_ignores, get_file_details,
                   get_syncthing, is_same_file, read_path_list, run_command,
                   write_checkfile)
@@ -121,10 +120,12 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
     """
 
     with Session(config.database) as session:
-        select_stmt = select(AllFiles.path, AllFiles.hash, AllFiles.modified, AllFiles.size)
+        select_stmt = select(AllFiles)
         logging.debug("SQL parancs futtatása: %s", select_stmt)
+        result = session.execute(select_stmt)
+        data = result.scalars().all()
         known_files: dict[str, tuple[NoHash | str, datetime, int]] = \
-            {path: (h, d, m) for (path, h, d, m) in session.scalars(select_stmt)}
+            {r.path: (r.hash, r.modified, r.size) for r in data}
 
     toplevel = get_syncthing("db/browse", config.global_config,
                              {"folder": config.folder_id, "levels": 0})
@@ -145,7 +146,7 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
             logging.warning("Ismeretlen fájltípus a Syncthing adatbázisában: %s", tl)
             continue
 
-    exists = {file: get_file_details(config.local_folder.joinpath(file), config) for file
+    exists = {file: get_file_details(Path(file), config) for file
               in added | changed if config.local_folder.joinpath(file).exists()}
 
     known_files.update(exists)

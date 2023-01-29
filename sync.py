@@ -11,9 +11,7 @@ from sqlalchemy.orm import Session
 import data_logger
 from archiver import update_all_files
 from change_listener import SyncthingChanges
-from config import AllFiles, FolderConfig
-from manager import FolderProperties
-from uploader import FolderUploaderQueue, UploaderAction
+from config import AllFiles, FolderConfig, FolderProperties, FolderUploaderQueue, UploaderAction
 from util import (discard_ignores, extend_ignores, get_file_details, get_remote_mod_times,
                   read_path_list, retry_on_error, run_command, write_checkfile)
 
@@ -74,7 +72,7 @@ class UploadSyncer:
                         actions["delete_folders"].append(path)
 
                     case {"type": "RemoteChangeDetected",
-                          "data": {"action": "modified", "path": path, "type": "file"}} | \
+                          "data": {"action": "modified", "path": path}} | \
                             {"type": "LocalChangeDetected",
                              "data": {"action": "modified", "path": path}}:
 
@@ -111,6 +109,8 @@ class UploadSyncer:
                     session.execute(delete_stmt)
 
                 if actions["copy"]:
+                    delete_stmt = delete(AllFiles).where(AllFiles.path.in_(actions["copy"]))
+                    session.execute(delete_stmt)
                     session.add_all(AllFiles(path=path,
                                              **dict(zip(("hash", "modified", "size"),
                                                         get_file_details(Path(path), self.config))))

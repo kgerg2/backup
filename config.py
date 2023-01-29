@@ -2,14 +2,16 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
+from multiprocessing import Process, Queue  # pylint: disable=unused-import
 from pathlib import Path
-from typing import Any, Iterable, Optional, TypeAlias
+from typing import Any, Iterable, Literal, NewType, Optional, Type, TypeAlias, TypeVar, TypedDict
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from change_listener import SyncthingChanges  # pylint: disable=unused-import
 # MOUNT_FOLDER = "/media/kgerg/TOSHIBA EXT"
 # CONFIG_DATA = METADATA_FOLDER.joinpath("config.json")
 # LOGGING_FILE = Path("~/Shared/Syncthing-dev/logs.txt").expanduser()
@@ -22,6 +24,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 # MESSAGE_LISTENER_AUTH_TOKEN = b"7iaJmp6vFgwzHb02KCMqEa77xqQaYRx3"
 
 # DEFAULT_HASHSUM = None
+
+UploadAction = Literal["copy", "move"]
+UploaderQueue = NewType("UploaderQueue",
+                        'Queue[tuple[Iterable[Path | str], UploadAction, Path | str, Path | str]]')
+
+UploaderAction = UploadAction | Literal["delete_files", "delete_folders"]
+FolderUploaderQueue = NewType(
+    "FolderUploaderQueue", "Queue[tuple[Iterable[Path | str], UploaderAction]]")
+
 
 
 TRASH_FOLDER_DEFAULT_NAME = ".trash"
@@ -45,6 +56,7 @@ class GlobalConfig:
     # config_file: Path
     logging_folder: Path
     logging_file: Path
+    last_event_file: Path
     time_format: str = "%Y-%m-%d_%H.%M.%S,%f"
     timezone: ZoneInfo = ZoneInfo("Europe/Budapest")
     syncthing_retry_count: int = 10
@@ -66,9 +78,17 @@ class GlobalConfig:
             config = json.load(f)
         return cls.from_dict(config)
 
+    T = TypeVar("T")
+    @staticmethod
+    def convert_type(value: Any, type: Type[T]) -> T:
+        if type is bytes:
+            return str(value).encode("utf-8") # type: ignore
+
+        return type(value)
+
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GlobalConfig":
-        typed_config = {key: field.type(value) for key, value in d.items() for field in fields(cls) if field.name == key}
+        typed_config = {key: cls.convert_type(value, field.type) for key, value in d.items() for field in fields(cls) if field.name == key}
         return GlobalConfig(**typed_config)
 
 @dataclass
@@ -90,9 +110,9 @@ class FolderConfig:
     def __init__(self,
                  global_config: GlobalConfig,
                  folder_id: str,
-                 database: Engine,
                  local_folder: Path | str,
                  remote_folder: Path | str,
+                 database_name: Optional[str] = None,
                  trash_folder: Optional[Path | str] = None,
                  metadata_folder: Optional[Path | str] = None,
                  archive_config: Optional[ArchiveConfig] = None,
@@ -114,7 +134,7 @@ class FolderConfig:
         self.trash_keep_time: timedelta = trash_keep_time
         self.local_keep_time: Optional[timedelta] = local_keep_time
         self.local_ignore_patterns: list[str] = list(local_ignore_patterns)
-        self.database: Engine = database
+        self.database: Engine = self.create_database(database_name)
 
     def get_summary(self) -> dict[str, Any]:
         """
@@ -132,9 +152,10 @@ class FolderConfig:
             "archive": asdict(self.archive_config) if self.archive_config is not None else None,
             "trash_keep_time": self.trash_keep_time.total_seconds()
         }
-        
+
     @classmethod
-    def read_from_file(cls, file: Path | str, global_config: Optional[GlobalConfig] = None) -> "FolderConfig":
+    def read_from_file(cls, file: Path | str, global_config: Optional[GlobalConfig] = None) \
+            -> "FolderConfig":
         """
         Reads the configuration from a file.
 
@@ -162,14 +183,11 @@ class FolderConfig:
             config.pop("global_config", None)
 
 
-        database = cls.create_database(config.pop("database", None))
-
-        return FolderConfig(global_config=global_config, database=database, **config)
+        return FolderConfig(global_config=global_config, **config)
 
 
 
-    @staticmethod
-    def create_database(database_name: Optional[str] = DATABASE_DEFAULT_NAME) -> Engine:
+    def create_database(self, database_name: Optional[str] = DATABASE_DEFAULT_NAME) -> Engine:
         """
         Creates an Sqlite database with the given name.
 
@@ -180,7 +198,9 @@ class FolderConfig:
 
         if database_name is None:
             database_name = DATABASE_DEFAULT_NAME
-        return create_engine(f"sqlite://{database_name}", echo=True)
+        engine = create_engine(f"sqlite:///{self.folder_id}-{database_name}.sqlite", echo=True)
+        Base.metadata.create_all(engine)
+        return engine
 
 
 class Base(DeclarativeBase):
@@ -204,26 +224,26 @@ class AllFiles(Base):
     cloud_only: Mapped[bool] = mapped_column(default=False)
 
     @hybrid_method
-    def is_relative_to(self, path: Path | str) -> bool:
+    def is_relative_to(self, path: str) -> bool:
         """
         Hybrid method for deciding whether a path in the database is relative to a given one.
 
-        :param Path | str path: The path to compare against.
+        :param str path: The path to compare against.
         :return bool: True if the path in the database is relative to the given one.
         """
 
-        return Path(self.path).is_relative_to(path)
+        return self.path.startswith(path)
 
     @hybrid_method
-    def is_relative_to_any(self, paths: Iterable[Path | str]) -> bool:
+    def is_relative_to_any(self, paths: Iterable[str]) -> bool:
         """
         Hybrid method for deciding whether a path in the database is relative to amy of the given
         ones.
 
-        :param Iterable[Path | str] paths: The paths to compare against.
+        :param Iterable[str] paths: The paths to compare against.
         :return bool: True if the path in the database is relative to any of the given ones.
         """
-        return any(Path(self.path).is_relative_to(path) for path in paths)
+        return any(self.is_relative_to(path) for path in paths)
 
 
 # class SyncEvents(Base):
@@ -236,3 +256,12 @@ class AllFiles(Base):
 #     action: Mapped[str]
 #     event_type: Mapped[str]
 #     file_type: Mapped[str]
+
+
+FolderProperties = TypedDict("FolderProperties", {
+    "config": FolderConfig,
+    "uploader_queue": FolderUploaderQueue,
+    "uploader_process": Process,
+    "folder_changes_queue": "Queue[SyncthingChanges]",
+    "upload_syncer_process": Process
+})
