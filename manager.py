@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import AuthenticationError, Process, Queue
 from multiprocessing.connection import Connection, Listener
-from pathlib import Path
 from time import sleep
 from typing import Any, Iterable, Optional
 
@@ -337,7 +336,7 @@ def main():
     start_process(processes["uploader"])
 
     folders: list[FolderProperties] = []
-    for file in Path("test-configs/folder-configs").iterdir():
+    for file in global_config.folder_configs.iterdir():
         config = FolderConfig.read_from_file(file, global_config)
         folder_uploader_queue: FolderUploaderQueue = Queue(maxsize=1000)  # type: ignore
         uploader_process = Process(target=FolderUploader,

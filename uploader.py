@@ -44,8 +44,8 @@ class Uploader:
                 logging.error("Feltöltés közben hiba történt. (Argumentumok: %s) %s", args,
                               format_exc())
 
-    def upload(self, paths: Iterable[Path | str], action: UploadAction, local_folder: Path | str, remote_folder: Path | str) \
-            -> None:
+    def upload(self, paths: Iterable[Path | str], action: UploadAction, local_folder: Path | str,
+               remote_folder: Path | str) -> None:
         """
         Runs the upload (copy or move) and sets the uploaded version date to the time of the
         last modification.
@@ -233,8 +233,9 @@ class FolderUploader:
         logging.debug("Mappa törlése: '%s'.", path)
 
         with Session(self.config.database) as session:
-            exists_stmt = select(AllFiles).where(AllFiles.is_relative_to(str(path))
-                                                 ).where(AllFiles.cloud_only).exists()
+            exists_stmt = select(AllFiles) \
+                .where(AllFiles.is_relative_to(str(path))) \
+                .where(AllFiles.cloud_only).exists()   # pylint: disable=no-value-for-parameter
             logging.debug("SQL parancs futtatása: %s", exists_stmt)
             if session.query(exists_stmt).scalar():
                 logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")

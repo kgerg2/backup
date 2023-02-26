@@ -97,7 +97,7 @@ class UploadSyncer:
                 if actions["delete_files"] or actions["delete_folders"]:
                     delete_stmt = delete(AllFiles) \
                         .where((AllFiles.path.in_(actions["delete_files"]) |
-                               AllFiles.is_relative_to_any(actions["delete_folders"]))
+                               AllFiles.is_relative_to_any(actions["delete_folders"]))  # pylint: disable=no-value-for-parameter
                                & ~AllFiles.cloud_only)
                     logging.debug("SQL parancs futtatása: %s", delete_stmt)
                     session.execute(delete_stmt)

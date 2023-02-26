@@ -197,6 +197,12 @@ def eject(archive_config: ArchiveConfig, global_config: GlobalConfig) -> None:
     """
 
     drive = archive_config.archive_device
+
+    if drive is None:
+        logging.warning("Az archiválás nem külső eszközre történik, de mégis annak leválasztása "
+                        "volt kezdeményezve.")
+        return
+
     logging.debug("%s eszköz kiadása.", drive)
 
     if drive is None:
@@ -216,6 +222,12 @@ def reconnect(archive_config: ArchiveConfig, global_config: GlobalConfig) -> Non
     """
 
     drive = archive_config.archive_device
+
+    if drive is None:
+        logging.warning("Az archiválás nem külső eszközre történik, de mégis annak csatlakoztatása"
+                        " volt kezdeményezve.")
+        return
+    
     logging.debug("%s eszköz csatlakoztatása.", drive)
 
     r = run_command(["findmnt", drive, "-J"], global_config,
@@ -262,14 +274,16 @@ def archive(folder_properties: FolderProperties, freeup_needed: int = 0) -> None
 
     archive_config = config.archive_config
 
-    reconnect(archive_config, config.global_config)
+    if archive_config.archive_device is not None:
+        reconnect(archive_config, config.global_config)
 
     try:
         sync_with_archive(config, freeup_needed)
     except:
         logging.error("Hiba történt az archiválás során: %s", traceback.format_exc())
     finally:
-        eject(archive_config, config.global_config)
+        if archive_config.archive_device is not None:
+            eject(archive_config, config.global_config)
 
 
 def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):

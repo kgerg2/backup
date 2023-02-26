@@ -57,6 +57,7 @@ class GlobalConfig:
     logging_folder: Path
     logging_file: Path
     last_event_file: Path
+    folder_configs: Path
     time_format: str = "%Y-%m-%d_%H.%M.%S,%f"
     timezone: ZoneInfo = ZoneInfo("Europe/Budapest")
     syncthing_retry_count: int = 10
@@ -80,11 +81,11 @@ class GlobalConfig:
 
     T = TypeVar("T")
     @staticmethod
-    def convert_type(value: Any, type: Type[T]) -> T:
-        if type is bytes:
+    def convert_type(value: Any, target_type: Type[T]) -> T:
+        if target_type is bytes:
             return bytes.fromhex(value) # type: ignore
 
-        return type(value)
+        return target_type(value)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GlobalConfig":
@@ -99,7 +100,7 @@ class ArchiveConfig:
 
     archive_folder: Path
     mount_folder: Path
-    archive_device: str
+    archive_device: Optional[str]
 
 
 class FolderConfig:
@@ -154,14 +155,12 @@ class FolderConfig:
         }
 
     @classmethod
-    def read_from_file(cls, file: Path | str, global_config: Optional[GlobalConfig] = None) \
-            -> "FolderConfig":
+    def read_from_file(cls, file: Path | str, global_config: GlobalConfig) -> "FolderConfig":
         """
         Reads the configuration from a file.
 
         :param Path | str file: The path to the file.
-        :param Optional[GlobalConfig] global_config: The global configuration, if not included,
-            will be read from the file, defaults to None
+        :param GlobalConfig global_config: The global configuration
         :raises ValueError: If the global configuration is not provided and the one in the file is
             neither a dictionary nor a string containing the path to another file.
         :return FolderConfig: The resulting configuration.
@@ -169,19 +168,6 @@ class FolderConfig:
 
         with open(file, encoding="utf-8") as f:
             config: dict = json.load(f)
-
-        if global_config is None:
-            global_config = config.pop("global_config")
-
-            if isinstance(global_config, dict):
-                global_config = GlobalConfig.from_dict(global_config)
-            elif isinstance(global_config, str):
-                global_config = GlobalConfig.read_from_file(global_config)
-            else:
-                raise ValueError("'global_config' must be a string ora  dictionary.")
-        else:
-            config.pop("global_config", None)
-
 
         return FolderConfig(global_config=global_config, **config)
 

@@ -124,7 +124,7 @@ def extend_file_info(file: Path | str, data: dict[str, tuple[str, datetime, int]
 
 
 def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, datetime, int]:
-    if path.is_dir():
+    if config.local_folder.joinpath(path).is_dir():
         hashsum = config.global_config.default_hashsum
     else:
         r = run_command(["rclone", "hashsum", "quickxor", config.local_folder.joinpath(path)], config.global_config,
