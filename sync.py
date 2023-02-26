@@ -54,20 +54,22 @@ class UploadSyncer:
                 "delete_folders": []
             }
 
-            local_deletes: list[str] = []
-
             for change in changes:
                 if change["data"]["folder"] != self.config.folder_id:
                     continue
 
                 match change:
                     case {"type": "RemoteChangeDetected",
-                          "data": {"action": "deleted", "path": path, "type": "file"}}:
+                          "data": {"action": "deleted", "path": path, "type": "file"}} | \
+                            {"type": "LocalChangeDetected",
+                              "data": {"action": "deleted", "path": path, "type": "file"}}:
 
                         actions["delete_files"].append(path)
 
                     case {"type": "RemoteChangeDetected",
-                          "data": {"action": "deleted", "path": path, "type": "dir"}}:
+                          "data": {"action": "deleted", "path": path, "type": "dir"}} | \
+                            {"type": "LocalChangeDetected",
+                              "data": {"action": "deleted", "path": path, "type": "dir"}}:
 
                         actions["delete_folders"].append(path)
 
@@ -78,17 +80,9 @@ class UploadSyncer:
 
                         actions["copy"].append(path)
 
-                    case {"type": "LocalChangeDetected",
-                          "data": {"action": "deleted", "path": path}}:
-
-                        local_deletes.append(path)
-
                     case other:
 
                         logging.warning("Ismeretlen változás a Syncthing üzenetben: %s", other)
-
-            if local_deletes:
-                extend_ignores(local_deletes, self.config)
 
             if not any(actions.values()):
                 continue

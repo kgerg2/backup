@@ -11,7 +11,7 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from change_listener import SyncthingChanges  # pylint: disable=unused-import
+# from change_listener import SyncthingChanges  # pylint: disable=unused-import
 # MOUNT_FOLDER = "/media/kgerg/TOSHIBA EXT"
 # CONFIG_DATA = METADATA_FOLDER.joinpath("config.json")
 # LOGGING_FILE = Path("~/Shared/Syncthing-dev/logs.txt").expanduser()
@@ -82,7 +82,7 @@ class GlobalConfig:
     @staticmethod
     def convert_type(value: Any, type: Type[T]) -> T:
         if type is bytes:
-            return str(value).encode("utf-8") # type: ignore
+            return bytes.fromhex(value) # type: ignore
 
         return type(value)
 
@@ -243,7 +243,7 @@ class AllFiles(Base):
         :param Iterable[str] paths: The paths to compare against.
         :return bool: True if the path in the database is relative to any of the given ones.
         """
-        return any(self.is_relative_to(path) for path in paths)
+        return any(self.path.startswith(path) for path in paths)
 
 
 # class SyncEvents(Base):

@@ -176,7 +176,7 @@ class FolderUploader:
         :param UploadAction action: the upload action
         """
         logging.debug("Feltöltendő fájlok szűrés előtt: %s", collect_files)
-        filtered_files = filter(self.check_file, collect_files)
+        filtered_files = [file for file in collect_files if self.check_file(file)]
         self.uploader_queue.put((filtered_files, action, self.config.local_folder,
                                  self.config.remote_folder))
 

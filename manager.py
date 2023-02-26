@@ -3,7 +3,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
-from multiprocessing import Process, Queue
+from multiprocessing import AuthenticationError, Process, Queue
 from multiprocessing.connection import Connection, Listener
 from pathlib import Path
 from time import sleep
@@ -150,7 +150,11 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                 conn.send("OK")
 
         case ["run", "check_processes"]:
-            check_processes(processes)
+            restarted = check_processes(processes)
+            if restarted:
+                conn.send(f"{len(restarted)} processes were restarted: {', '.join(restarted)}")
+            else:
+                conn.send("All processes are running.")
 
         case ["run", task] if task in commands:  # pylint: disable=used-before-assignment
             task = TASKS[commands[task]]
@@ -163,13 +167,19 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                                    args=task.args)
             task_process.start()
 
+        case _:
+            conn.send(f"Unrecognized request: {msg}")
+
 
 def check_processes(processes: dict[str, dict[str, Any]]):
+    restarted: list[str] = []
     for name, spec in processes.items():
         if "process" not in spec or not spec["process"].is_alive():
             logging.warning("Egy folyamat nem fut, ezért újraindításra kerül: %s", name)
+            restarted.append(name)
             start_process(spec)
 
+    return restarted
 
 def do_for_all_folders(task: Callable[[FolderProperties], None], folders: Iterable[FolderProperties]) -> None:
     for folder in folders:
@@ -368,7 +378,12 @@ def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueu
 
     while True:
         try:
-            conn = listener.accept()
+            try:
+                conn = listener.accept()
+            except AuthenticationError:
+                logging.warning("Csatlakozási kísérlet elutasítva a hibás azonosító miatt.")
+                continue
+
             logging.info("Csatlakozás az archiválóhoz: %s", listener.last_accepted)
             while True:
                 try:
