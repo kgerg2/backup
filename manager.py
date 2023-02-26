@@ -155,7 +155,16 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             else:
                 conn.send("All processes are running.")
 
-        case ["run", task] if task in commands:  # pylint: disable=used-before-assignment
+        case ["run", "archive", folder, *args] \
+                if any(folder == config["config"].folder_id for config in folders):
+            folder_properties = next(config for config in folders 
+                                     if folder == config["config"].folder_id)
+            task_process = Process(target=archive,
+                                   args=[folder_properties, *args])
+            task_process.start()
+
+
+        case ["run", task, *args] if task in commands:  # pylint: disable=used-before-assignment
             task = TASKS[commands[task]]
             if task.task is check_processes:
                 task.args = [processes]
@@ -163,7 +172,7 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                 task.args.append(folders)
 
             task_process = Process(target=task.task,
-                                   args=task.args)
+                                   args=task.args + args)
             task_process.start()
 
         case _:
@@ -180,9 +189,9 @@ def check_processes(processes: dict[str, dict[str, Any]]):
 
     return restarted
 
-def do_for_all_folders(task: Callable[[FolderProperties], None], folders: Iterable[FolderProperties]) -> None:
+def do_for_all_folders(task: Callable[[FolderProperties], None], folders: Iterable[FolderProperties], *args) -> None:
     for folder in folders:
-        task(folder)
+        task(folder, *args)
 
 
 TASKS = (

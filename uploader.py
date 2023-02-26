@@ -235,7 +235,7 @@ class FolderUploader:
         with Session(self.config.database) as session:
             exists_stmt = select(AllFiles) \
                 .where(AllFiles.is_relative_to(str(path))) \
-                .where(AllFiles.cloud_only).exists()   # pylint: disable=no-value-for-parameter
+                .where(AllFiles.cloud_only).exists()  # pylint: disable=no-value-for-parameter
             logging.debug("SQL parancs futtatása: %s", exists_stmt)
             if session.query(exists_stmt).scalar():
                 logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")

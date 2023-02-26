@@ -4,10 +4,11 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta
 from multiprocessing import Process, Queue  # pylint: disable=unused-import
 from pathlib import Path
-from typing import Any, Iterable, Literal, NewType, Optional, Type, TypeAlias, TypeVar, TypedDict
+from types import NoneType
+from typing import Any, Iterable, Literal, NewType, Optional, Self, Type, TypeAlias, TypeVar, TypedDict, Union, get_args, get_origin
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import CollectionAggregate, ColumnElement, Engine, create_engine, any_, or_
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -49,7 +50,39 @@ DEFAULT_LOCAL_IGNORES = (
 NoHash: TypeAlias = Any
 
 @dataclass
-class GlobalConfig:
+class DataClassWithFromDict:
+    T = TypeVar("T")
+    @classmethod
+    def convert_type(cls, value: Any, target_type: Type[T]) -> T:
+        if get_origin(target_type) == Union:
+            union_args = get_args(target_type)
+
+            if NoneType in union_args and value is None:
+                return None  # type: ignore
+
+            union_args = filter(lambda x: x != NoneType, union_args)
+
+            for type in union_args:
+                try:
+                    return cls.convert_type(value, type)
+                except TypeError:
+                    continue
+
+            raise ValueError(f"Cannot convert {value} to {target_type}")
+
+        if target_type is bytes:
+            return bytes.fromhex(value) # type: ignore
+
+        return target_type(value)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> Self:
+        typed_config = {key: cls.convert_type(value, field.type) for key, value in d.items() for field in fields(cls) if field.name == key}
+        return cls(**typed_config)
+
+
+@dataclass
+class GlobalConfig(DataClassWithFromDict):
     api_key: str
     message_listener_address: tuple[str, int]
     message_listener_auth_token: bytes
@@ -68,7 +101,7 @@ class GlobalConfig:
     default_hashsum: NoHash = None
 
     @classmethod
-    def read_from_file(cls, file: Path | str) -> "GlobalConfig":
+    def read_from_file(cls, file: Path | str) -> Self:
         """
         Reads the global configuration from a file.
 
@@ -79,28 +112,16 @@ class GlobalConfig:
             config = json.load(f)
         return cls.from_dict(config)
 
-    T = TypeVar("T")
-    @staticmethod
-    def convert_type(value: Any, target_type: Type[T]) -> T:
-        if target_type is bytes:
-            return bytes.fromhex(value) # type: ignore
-
-        return target_type(value)
-
-    @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "GlobalConfig":
-        typed_config = {key: cls.convert_type(value, field.type) for key, value in d.items() for field in fields(cls) if field.name == key}
-        return GlobalConfig(**typed_config)
 
 @dataclass
-class ArchiveConfig:
+class ArchiveConfig(DataClassWithFromDict):
     """
     Configuration for archival.
     """
 
     archive_folder: Path
-    mount_folder: Path
-    archive_device: Optional[str]
+    mount_folder: Optional[Path] = None
+    archive_device: Optional[str] = None
 
 
 class FolderConfig:
@@ -155,7 +176,7 @@ class FolderConfig:
         }
 
     @classmethod
-    def read_from_file(cls, file: Path | str, global_config: GlobalConfig) -> "FolderConfig":
+    def read_from_file(cls, file: Path | str, global_config: GlobalConfig) -> Self:
         """
         Reads the configuration from a file.
 
@@ -168,6 +189,9 @@ class FolderConfig:
 
         with open(file, encoding="utf-8") as f:
             config: dict = json.load(f)
+
+        if "archive_config" in config:
+            config["archive_config"] = ArchiveConfig.from_dict(config["archive_config"])
 
         return FolderConfig(global_config=global_config, **config)
 
@@ -230,6 +254,10 @@ class AllFiles(Base):
         :return bool: True if the path in the database is relative to any of the given ones.
         """
         return any(self.path.startswith(path) for path in paths)
+
+    @is_relative_to_any.expression
+    def is_relative_to_any(cls, paths: Iterable[str]) -> ColumnElement[bool]:
+        return or_(*[cls.path.startswith(path) for path in paths])
 
 
 # class SyncEvents(Base):

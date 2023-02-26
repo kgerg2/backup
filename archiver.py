@@ -146,6 +146,8 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
             logging.warning("Ismeretlen fájltípus a Syncthing adatbázisában: %s", tl)
             continue
 
+    discard_ignores(added | removed | changed, config)
+
     exists = {file: get_file_details(Path(file), config) for file
               in added | changed if config.local_folder.joinpath(file).exists()}
 
@@ -222,8 +224,9 @@ def reconnect(archive_config: ArchiveConfig, global_config: GlobalConfig) -> Non
     """
 
     drive = archive_config.archive_device
+    mount_folder = archive_config.mount_folder
 
-    if drive is None:
+    if drive is None or mount_folder is None:
         logging.warning("Az archiválás nem külső eszközre történik, de mégis annak csatlakoztatása"
                         " volt kezdeményezve.")
         return
@@ -246,11 +249,11 @@ def reconnect(archive_config: ArchiveConfig, global_config: GlobalConfig) -> Non
 
     run_command(["sudo", "eject", "-t", drive], global_config,
                 error_message=f"A külső merevlemez ({drive}) csatlakoztatása sikertelen.")
-    if not Path(archive_config.mount_folder).exists():
-        run_command(["sudo", "mkdir", archive_config.mount_folder], global_config,
+    if not Path(mount_folder).exists():
+        run_command(["sudo", "mkdir", mount_folder], global_config,
                     error_message="A mount mappa létrehozása sikertelen.")
-        # Path(archive_config.mount_folder).mkdir(exist_ok=True)
-    run_command(["sudo", "mount", drive, archive_config.mount_folder], global_config,
+        # Path(mount_folder).mkdir(exist_ok=True)
+    run_command(["sudo", "mount", drive, mount_folder], global_config,
                 error_message="A mount művelet sikertelen.")
 
 
@@ -300,6 +303,7 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
         return
 
     archive_config = config.archive_config
+    archive_config.archive_folder.mkdir(parents=True, exist_ok=True)
 
     global_files = update_all_files(config, return_directories=False)
 

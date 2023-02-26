@@ -12,7 +12,7 @@ import data_logger
 from archiver import update_all_files
 from change_listener import SyncthingChanges
 from config import AllFiles, FolderConfig, FolderProperties, FolderUploaderQueue, UploaderAction
-from util import (discard_ignores, extend_ignores, get_file_details, get_remote_mod_times,
+from util import (discard_ignores, get_file_details, get_remote_mod_times,
                   read_path_list, retry_on_error, run_command, write_checkfile)
 
 
