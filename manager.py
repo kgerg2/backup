@@ -11,13 +11,13 @@ from typing import Any, Iterable, Optional
 import multiprocessing_logging
 from dateutil.relativedelta import relativedelta
 
-from archiver import archive
+from archiver import archive, update_all_files
 from change_listener import SyncthingChangeListener, SyncthingChanges
 from config import FolderConfig, GlobalConfig, FolderProperties, FolderUploaderQueue, UploaderQueue
 from sync import UploadSyncer, sync_from_cloud
 from trashhandler import handle_trash
 from uploader import FolderUploader, Uploader
-from util import retry_on_error
+from util import extend_ignores, retry_on_error
 
 
 class TimedTask:
@@ -157,12 +157,20 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
 
         case ["run", "archive", folder, *args] \
                 if any(folder == config["config"].folder_id for config in folders):
-            folder_properties = next(config for config in folders 
+            folder_properties = next(config for config in folders
                                      if folder == config["config"].folder_id)
             task_process = Process(target=archive,
                                    args=[folder_properties, *args])
             task_process.start()
 
+        case ["run", "update_all_files", folder] \
+                if any(folder == config["config"].folder_id for config in folders):
+            folder_properties = next(config for config in folders
+                                     if folder == config["config"].folder_id)
+            folder_config = folder_properties["config"]
+            task_process = Process(target=update_all_files,
+                                   args=[folder_config])
+            task_process.start()
 
         case ["run", task, *args] if task in commands:  # pylint: disable=used-before-assignment
             task = TASKS[commands[task]]
@@ -188,6 +196,7 @@ def check_processes(processes: dict[str, dict[str, Any]]):
             start_process(spec)
 
     return restarted
+
 
 def do_for_all_folders(task: Callable[[FolderProperties], None], folders: Iterable[FolderProperties], *args) -> None:
     for folder in folders:
@@ -364,6 +373,8 @@ def main():
             "upload_syncer_process": upload_syncer_process
         })
 
+        extend_ignores(config.default_syncthing_ignores, config)
+
     processes["change_listener"] = {
         "target": SyncthingChangeListener,
         "args": [global_config, [f["folder_changes_queue"] for f in folders]]
@@ -376,6 +387,7 @@ def main():
     return retry_on_error(run_message_server,
                           args=(global_config, uploader_queue, processes, folders),
                           error_message="Az üzenetfogadás során hiba történt.")
+
 
 def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueue,
                        processes: dict[str, dict[str, Any]], folders: list[FolderProperties]):
@@ -409,6 +421,7 @@ def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueu
                 process_message(msg, conn, global_config, folders, uploader_queue, processes)
         except EOFError:
             logging.warning("Hibás fogadott üzenet.")
+
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,6 @@
 import logging
 import traceback
+from datetime import datetime
 from multiprocessing import Queue
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -11,7 +12,8 @@ from sqlalchemy.orm import Session
 import data_logger
 from archiver import update_all_files
 from change_listener import SyncthingChanges
-from config import AllFiles, FolderConfig, FolderProperties, FolderUploaderQueue, UploaderAction
+from config import (AllFiles, FolderConfig, FolderProperties,
+                    FolderUploaderQueue, UploaderAction)
 from util import (discard_ignores, get_file_details, get_remote_mod_times,
                   read_path_list, retry_on_error, run_command, write_checkfile)
 
@@ -84,6 +86,19 @@ class UploadSyncer:
 
                         logging.warning("Ismeretlen változás a Syncthing üzenetben: %s", other)
 
+            if actions["copy"]:
+                with Session(self.config.database) as session:
+                    select_stmt = select(AllFiles) \
+                        .where(AllFiles.path.in_(actions["copy"]) & AllFiles.modified.is_(None) &
+                            AllFiles.uploaded.isnot(None))
+                    logging.debug("SQL parancs futtatása: %s", select_stmt)
+                    file_objs = session.execute(select_stmt)
+                    for file in file_objs:
+                        path = file.AllFiles.path
+                        actions["copy"].remove(path)
+                        file.AllFiles.hash, file.AllFiles.modified, file.AllFiles.size = get_file_details(Path(path), self.config)
+                    session.commit()
+
             if not any(actions.values()):
                 continue
 
@@ -152,8 +167,9 @@ def sync_from_cloud(folder_properties: FolderProperties):
 
         upload_files = read_path_list(not_uploaded_files_path, default=[])
 
-        download_files = set(read_path_list(remotely_added_files, default=[]))
+        new_download_files = set(read_path_list(remotely_added_files, default=[]))
 
+    download_files = new_download_files.copy()
     remote_times = get_remote_mod_times(bisync_files, config)
     for file in bisync_files:
         if remote_times[file][0] > files[file][1]:
@@ -176,6 +192,13 @@ def sync_from_cloud(folder_properties: FolderProperties):
                 data_logger.log(config.global_config, deletion_missed)
                 uploader_queue.put((deletion_missed, "delete_files"))
 
+            if new_download_files:
+                # logging.debug("%d új fájl letöltése.", len(new_download_files))
+                # data_logger.log(config.global_config, new_download_files)
+                session.add_all(AllFiles(path=path, uploaded=datetime.now())
+                                for path in new_download_files)
+                session.commit()
+
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
                 f.flush()
@@ -188,7 +211,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
             if r.returncode == 0:
                 with Session(config.database) as session:
                     update_stmt = update(AllFiles) \
-                        .where(AllFiles.path.in_(tuple(download_files))) \
+                        .where(AllFiles.path.in_(tuple(download_files)) & AllFiles.modified.is_not(None)) \
                         .values(uploaded=AllFiles.modified)
                     logging.debug("SQL parancs futtatása: %s", update_stmt)
                     session.execute(update_stmt)

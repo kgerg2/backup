@@ -1,14 +1,15 @@
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from multiprocessing import Process, Queue  # pylint: disable=unused-import
 from pathlib import Path
 from types import NoneType
-from typing import Any, Iterable, Literal, NewType, Optional, Self, Type, TypeAlias, TypeVar, TypedDict, Union, get_args, get_origin
+from typing import (Any, Iterable, Literal, NewType, Optional, Self, Type,
+                    TypeAlias, TypedDict, TypeVar, Union, get_args, get_origin)
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import CollectionAggregate, ColumnElement, Engine, create_engine, any_, or_
+from sqlalchemy import ColumnElement, Engine, create_engine, or_
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -40,11 +41,11 @@ TRASH_FOLDER_DEFAULT_NAME = ".trash"
 METADATA_FOLDER_DEFAULT_NAME = ".backupdata"
 DATABASE_DEFAULT_NAME = "files"
 DEFAULT_LOCAL_IGNORES = (
-    ".backupdata",
-    ".trash",
     ".stfolder",
     ".stignore",
-    ".stversions"
+    ".stversions",
+    TRASH_FOLDER_DEFAULT_NAME,
+    METADATA_FOLDER_DEFAULT_NAME
 )
 
 NoHash: TypeAlias = Any
@@ -123,6 +124,16 @@ class ArchiveConfig(DataClassWithFromDict):
     mount_folder: Optional[Path] = None
     archive_device: Optional[str] = None
 
+    def get_summary(self) -> dict[str, Any]:
+        """
+        Returns a summary of the configuration.
+        """
+        return {
+            "archive_folder": str(self.archive_folder),
+            "mount_folder": str(self.mount_folder),
+            "archive_device": self.archive_device
+        }
+
 
 class FolderConfig:
     """
@@ -158,6 +169,11 @@ class FolderConfig:
         self.local_ignore_patterns: list[str] = list(local_ignore_patterns)
         self.database: Engine = self.create_database(database_name)
 
+        self.default_syncthing_ignores: list[str] = [
+            f"/{self.trash_folder.name}",
+            f"/{self.metadata_folder.name}"
+        ]
+
     def get_summary(self) -> dict[str, Any]:
         """
         Return a summary of the configuration.
@@ -171,7 +187,7 @@ class FolderConfig:
             "remote_folder": str(self.remote_folder),
             "trash_folder": str(self.trash_folder),
             "metadata_folder": str(self.metadata_folder),
-            "archive": asdict(self.archive_config) if self.archive_config is not None else None,
+            "archive": self.archive_config.get_summary() if self.archive_config is not None else None,
             "trash_keep_time": self.trash_keep_time.total_seconds()
         }
 
@@ -227,9 +243,9 @@ class AllFiles(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     path: Mapped[str]
-    size: Mapped[int]
+    size: Mapped[int | None]
     hash: Mapped[str | None]
-    modified: Mapped[datetime]
+    modified: Mapped[datetime | None]
     uploaded: Mapped[datetime | None]  # last modification of the uploaded version
     cloud_only: Mapped[bool] = mapped_column(default=False)
 
