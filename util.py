@@ -12,7 +12,7 @@ from time import sleep, time
 from typing import Any, Optional, TypeVar
 
 import requests
-from sqlalchemy import select
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 import data_logger
@@ -408,3 +408,10 @@ def retry_on_error(function: Callable[..., T], max_retry_count: int = 10, retry_
                 logging.critical("A %s függvény futása során túl sok hiba történt, nem lesz "
                                  "újraindítva.", function)
                 raise
+
+
+def file_exisis_in_database(database: Engine, regex: str) -> bool:
+    with Session(database) as session:
+        select_stmt = select(AllFiles).where(AllFiles.path.regexp_match(regex))
+        logging.debug("SQL parancs futtatása: %s", select_stmt)
+        return session.execute(select_stmt).first() is not None

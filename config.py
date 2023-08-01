@@ -149,6 +149,8 @@ class FolderConfig:
                  trash_folder: Optional[Path | str] = None,
                  metadata_folder: Optional[Path | str] = None,
                  archive_config: Optional[ArchiveConfig] = None,
+                 cloud_only_defaults: Sequence[str | tuple[str | Sequence[str],
+                                                           str | Sequence[str]]] = (),
                  trash_keep_time: timedelta = timedelta(days=60),
                  local_keep_time: Optional[timedelta] = timedelta(days=60),
                  local_ignore_patterns: Sequence[str] = DEFAULT_LOCAL_IGNORES) -> None:
@@ -164,6 +166,11 @@ class FolderConfig:
             metadata_folder = self.local_folder.joinpath(METADATA_FOLDER_DEFAULT_NAME)
         self.metadata_folder: Path = Path(metadata_folder)
         self.archive_config: Optional[ArchiveConfig] = archive_config
+        self.cloud_only_defaults: list[tuple[list[str], list[str]]] = [
+            ([item], []) if isinstance(item, str) else
+             tuple(map(lambda x: [x] if isinstance(x, str) else x, item))
+             for item in cloud_only_defaults
+        ]
         self.trash_keep_time: timedelta = trash_keep_time
         self.local_keep_time: Optional[timedelta] = local_keep_time
         self.local_ignore_patterns: list[str] = list(local_ignore_patterns)
@@ -187,8 +194,13 @@ class FolderConfig:
             "remote_folder": str(self.remote_folder),
             "trash_folder": str(self.trash_folder),
             "metadata_folder": str(self.metadata_folder),
-            "archive": self.archive_config.get_summary() if self.archive_config is not None else None,
-            "trash_keep_time": self.trash_keep_time.total_seconds()
+            "archive": self.archive_config.get_summary()
+                if self.archive_config is not None else None,
+            "cloud_only_defaults": self.cloud_only_defaults,
+            "trash_keep_time": self.trash_keep_time.total_seconds(),
+            "local_keep_time": self.local_keep_time.total_seconds()
+                if self.local_keep_time is not None else None,
+            "local_ignore_patterns": self.local_ignore_patterns
         }
 
     @classmethod

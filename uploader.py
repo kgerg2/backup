@@ -1,13 +1,12 @@
 import logging
 from collections.abc import Iterable
-from multiprocessing import Queue  # pylint: disable=unused-import
 from pathlib import Path
 from queue import Empty
 from tempfile import NamedTemporaryFile
 from traceback import format_exc
 from typing import NoReturn, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.orm import Session
 
 import data_logger
@@ -195,7 +194,22 @@ class FolderUploader:
         :param Iterable[Path | str] paths: the files to be deleted
         """
 
-        paths = [str(path) for path in paths]
+        paths = {str(path) for path in paths}
+
+        with Session(self.config.database) as session:
+            select_stmt = select(AllFiles.path).where(AllFiles.path.in_(paths)
+                                                      & (AllFiles.size.is_not(None)
+                                                      | AllFiles.hash.is_not(None)
+                                                      | AllFiles.modified.is_not(None)))
+            logging.debug("SQL parancs futtatása: %s", select_stmt)
+            result = set(session.scalars(select_stmt))
+
+        if result:
+            logging.warning("%d fájl nem lett eltávolítva lokálisan, ezért a felhőből sem lesz "
+                            "törölve", len(result))
+            data_logger.log(self.config.global_config, requested_deletion=paths, not_deleted=result)
+            paths -= result
+
         logging.debug("Fájlok törlése (%d db).", len(paths))
         data_logger.log(self.config.global_config, paths)
 
@@ -206,11 +220,11 @@ class FolderUploader:
                         self.config.global_config,
                         error_message="Hiba történt a fájlok törlése közben.")
 
-        # with Session(self.config.database) as session:
-        #     delete_stmt = delete(AllFiles).where(AllFiles.path.in_(paths))
-        #     logging.debug("SQL parancs futtatása: %s", delete_stmt)
-        #     session.execute(delete_stmt)
-        #     session.commit()
+        with Session(self.config.database) as session:
+            delete_stmt = delete(AllFiles).where(AllFiles.path.in_(paths))
+            logging.debug("SQL parancs futtatása: %s", delete_stmt)
+            session.execute(delete_stmt)
+            session.commit()
 
     def delete_folders(self, paths: Iterable[Path | str]) -> None:
         """
@@ -230,26 +244,39 @@ class FolderUploader:
         :param Path | str path: the directory to be deleted
         """
 
+        path = str(path)
         logging.debug("Mappa törlése: '%s'.", path)
 
         with Session(self.config.database) as session:
             exists_stmt = select(AllFiles) \
-                .where(AllFiles.is_relative_to(str(path))) \
-                .where(AllFiles.cloud_only).exists()  # pylint: disable=no-value-for-parameter
+                .where(AllFiles.is_relative_to(path)
+                       & AllFiles.cloud_only).exists()  # pylint: disable=no-value-for-parameter
             logging.debug("SQL parancs futtatása: %s", exists_stmt)
             if session.query(exists_stmt).scalar():
                 logging.warning("A mappa törlése nem lehetséges a csak felhőbeli fájlok miatt.")
                 return
 
+            select_stmt = select(AllFiles.path) \
+                .where(AllFiles.is_relative_to(path) & (AllFiles.size.is_not(None)
+                       | AllFiles.hash.is_not(None) | AllFiles.modified.is_not(None))
+                       )  # pylint: disable=no-value-for-parameter
+            logging.debug("SQL parancs futtatása: %s", select_stmt)
+            result = session.execute(select_stmt).scalars().all()
+            if result:
+                logging.warning("A '%s' mappa nem lett eltávolítva lokálisan, ezért a felhőből sem "
+                                "lesz törölve.", path)
+                data_logger.log(self.config.global_config, not_deleted_locally=result)
+                return
+
             run_command(["rclone", "purge", self.config.remote_folder.joinpath(path)],
                         self.config.global_config,
-                        error_message=f"Hiba történt a '{path}' mappa törlése közben.",
-                        strict=False)
+                        error_message=f"Hiba történt a '{path}' mappa törlése közben.")
 
-            # delete_stmt = delete(AllFiles).where(AllFiles.is_relative_to(path))
-            # logging.debug("SQL parancs futtatása: %s", delete_stmt)
-            # session.execute(delete_stmt)
-            # session.commit()
+            delete_stmt = delete(AllFiles) \
+                .where(AllFiles.is_relative_to(path))  # pylint: disable=no-value-for-parameter
+            logging.debug("SQL parancs futtatása: %s", delete_stmt)
+            session.execute(delete_stmt)
+            session.commit()
 
     @staticmethod
     def check_file(file: str | Path) -> bool:

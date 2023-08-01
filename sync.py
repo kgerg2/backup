@@ -1,10 +1,11 @@
 import logging
+import re
 import traceback
 from datetime import datetime
 from multiprocessing import Queue
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
-from typing import NoReturn
+from typing import Iterable, NoReturn
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
@@ -14,7 +15,7 @@ from archiver import update_all_files
 from change_listener import SyncthingChanges
 from config import (AllFiles, FolderConfig, FolderProperties,
                     FolderUploaderQueue, UploaderAction)
-from util import (discard_ignores, get_file_details, get_remote_mod_times,
+from util import (discard_ignores, get_file_details, get_remote_file_info, get_remote_mod_times,
                   read_path_list, retry_on_error, run_command, write_checkfile)
 
 
@@ -64,14 +65,14 @@ class UploadSyncer:
                     case {"type": "RemoteChangeDetected",
                           "data": {"action": "deleted", "path": path, "type": "file"}} | \
                             {"type": "LocalChangeDetected",
-                              "data": {"action": "deleted", "path": path, "type": "file"}}:
+                             "data": {"action": "deleted", "path": path, "type": "file"}}:
 
                         actions["delete_files"].append(path)
 
                     case {"type": "RemoteChangeDetected",
                           "data": {"action": "deleted", "path": path, "type": "dir"}} | \
                             {"type": "LocalChangeDetected",
-                              "data": {"action": "deleted", "path": path, "type": "dir"}}:
+                             "data": {"action": "deleted", "path": path, "type": "dir"}}:
 
                         actions["delete_folders"].append(path)
 
@@ -90,32 +91,27 @@ class UploadSyncer:
                 with Session(self.config.database) as session:
                     select_stmt = select(AllFiles) \
                         .where(AllFiles.path.in_(actions["copy"]) & AllFiles.modified.is_(None) &
-                            AllFiles.uploaded.isnot(None))
+                               AllFiles.uploaded.isnot(None))
                     logging.debug("SQL parancs futtatása: %s", select_stmt)
                     file_objs = session.execute(select_stmt)
                     for file in file_objs:
                         path = file.AllFiles.path
                         actions["copy"].remove(path)
-                        file.AllFiles.hash, file.AllFiles.modified, file.AllFiles.size = get_file_details(Path(path), self.config)
+                        file.AllFiles.hash, file.AllFiles.modified, file.AllFiles.size = \
+                            get_file_details(Path(path), self.config)
                     session.commit()
 
             if not any(actions.values()):
                 continue
 
-            for action, paths in actions.items():
-                if not paths:
-                    continue
-
-                self.upload_queue.put((paths, action))
-
             with Session(self.config.database) as session:
                 if actions["delete_files"] or actions["delete_folders"]:
-                    delete_stmt = delete(AllFiles) \
-                        .where((AllFiles.path.in_(actions["delete_files"]) |
-                               AllFiles.is_relative_to_any(actions["delete_folders"]))  # pylint: disable=no-value-for-parameter
-                               & ~AllFiles.cloud_only)
-                    logging.debug("SQL parancs futtatása: %s", delete_stmt)
-                    session.execute(delete_stmt)
+                    update_stmt = update(AllFiles) \
+                        .where(AllFiles.path.in_(actions["delete_files"]) |
+                               AllFiles.is_relative_to_any(actions["delete_folders"])) \
+                        .values(size=None, hash=None, modified=None)  # pylint: disable=no-value-for-parameter
+                    logging.debug("SQL parancs futtatása: %s", update_stmt)
+                    session.execute(update_stmt)
 
                 if actions["copy"]:
                     delete_stmt = delete(AllFiles).where(AllFiles.path.in_(actions["copy"]))
@@ -126,6 +122,69 @@ class UploadSyncer:
                                     for path in actions["copy"])
 
                 session.commit()
+
+            for action, paths in actions.items():
+                if not paths:
+                    continue
+
+                self.upload_queue.put((paths, action))
+
+
+def filter_cloud_only_files(files: Iterable[str], config: FolderConfig) -> set[str]:
+    """
+    Filters out files that should automatically be cloud only based on the rules specified in the
+    folder config.
+
+    :param Iterable[str] files: the files to filter
+    :param FolderConfig config: the config for the folder
+    :return set[str]: the filtered files
+    """
+
+    def should_be_cloud_only(file: str, rule: str, criterions: Iterable[str]) -> bool:
+        """
+        Checks if a file should be cloud only based on a rule and criterions.
+
+        :param str file: the file to check
+        :param str rule: the rule to check
+        :param Iterable[str] criterions: the criterions to check
+        :return bool: True if the file should be cloud only, False otherwise
+        """
+
+        match = re.fullmatch(rule, file)
+        if not match:
+            return False
+
+        if not criterions:
+            return True
+
+        criterion = "|".join(
+            f"({criterion.format(**{k: re.escape(v) for k, v in match.groupdict().items()})})"
+            for criterion in criterions)
+        criterion = f"^({criterion})$"
+
+        if any(re.match(criterion, download_file) for download_file in files):
+            return True
+
+        with Session(config.database) as session:
+            select_stmt = select(AllFiles).where(AllFiles.path.regexp_match(criterion))
+            logging.debug("SQL parancs futtatása: %s", select_stmt)
+            return session.execute(select_stmt).first() is not None
+
+
+    filtered = {file for targets, criterions in config.cloud_only_defaults
+                for target in targets
+                for file in files
+                if should_be_cloud_only(file, target, criterions)}
+
+    remote_info = get_remote_file_info(filtered, config)
+
+    with Session(config.database) as session:
+        session.add_all(
+            AllFiles(path=file, size=s, hash=h, modified=t, uploaded=t, cloud_only=True)
+            for file, (h, t, s) in remote_info.items())
+        session.commit()
+
+    return files - filtered
 
 
 def sync_from_cloud(folder_properties: FolderProperties):
@@ -169,6 +228,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
 
         new_download_files = set(read_path_list(remotely_added_files, default=[]))
 
+    new_download_files = filter_cloud_only_files(new_download_files, config)
     download_files = new_download_files.copy()
     remote_times = get_remote_mod_times(bisync_files, config)
     for file in bisync_files:
@@ -180,24 +240,23 @@ def sync_from_cloud(folder_properties: FolderProperties):
     if download_files:
         try:
             with Session(config.database) as session:
-                select_stmt = select(AllFiles.path).where(AllFiles.uploaded.is_not(None))
+                select_stmt = select(AllFiles.path).where(AllFiles.uploaded.is_not(None)
+                                                          & AllFiles.path.in_(download_files)
+                                                          & AllFiles.size.is_(None))
                 logging.debug("SQL parancs futtatása: %s", select_stmt)
-                uploaded_files = session.scalars(select_stmt)
+                deletion_missed = set(session.scalars(select_stmt))
 
-            deletion_missed = download_files & set(uploaded_files)
-            download_files = download_files - deletion_missed
+                download_files -= deletion_missed
+
+                if new_download_files:
+                    session.add_all(AllFiles(path=path, uploaded=datetime.now())
+                                    for path in new_download_files)
+                    session.commit()
 
             if deletion_missed:
                 logging.warning("%d fájl törlése elmaradt, pótlás most.", len(deletion_missed))
                 data_logger.log(config.global_config, deletion_missed)
                 uploader_queue.put((deletion_missed, "delete_files"))
-
-            if new_download_files:
-                # logging.debug("%d új fájl letöltése.", len(new_download_files))
-                # data_logger.log(config.global_config, new_download_files)
-                session.add_all(AllFiles(path=path, uploaded=datetime.now())
-                                for path in new_download_files)
-                session.commit()
 
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
@@ -211,7 +270,8 @@ def sync_from_cloud(folder_properties: FolderProperties):
             if r.returncode == 0:
                 with Session(config.database) as session:
                     update_stmt = update(AllFiles) \
-                        .where(AllFiles.path.in_(tuple(download_files)) & AllFiles.modified.is_not(None)) \
+                        .where(AllFiles.path.in_(tuple(download_files)) &
+                               AllFiles.modified.is_not(None)) \
                         .values(uploaded=AllFiles.modified)
                     logging.debug("SQL parancs futtatása: %s", update_stmt)
                     session.execute(update_stmt)
