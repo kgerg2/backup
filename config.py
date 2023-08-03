@@ -1,6 +1,6 @@
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timedelta
 from multiprocessing import Process, Queue  # pylint: disable=unused-import
 from pathlib import Path
@@ -47,6 +47,8 @@ DEFAULT_LOCAL_IGNORES = (
     TRASH_FOLDER_DEFAULT_NAME,
     METADATA_FOLDER_DEFAULT_NAME
 )
+DEFAULT_RCLONE_GUI_URL_PATTERN = r"http://(?P<user>\S+):(?P<password>\S+)@" \
+    r"(?P<host>\S+):(?P<port>\d+)/\?.*login_token=(?P<login_token>\S+) "
 
 NoHash: TypeAlias = Any
 
@@ -83,6 +85,33 @@ class DataClassWithFromDict:
 
 
 @dataclass
+class RcloneGUIConfig(DataClassWithFromDict):
+    """
+    Configuration for the Rclone GUI.
+    """
+
+    host: str
+    port: int
+    user: str
+    password: str
+    login_token: str
+    special_commands: dict[str, tuple[str, list[str]]] = field(default_factory = lambda: {
+        "copy": ("sync/copy", ["srcFs", "dstFs", "createEmptySrcDirs"]),
+        "move": ("sync/move", ["srcFs", "dstFs", "createEmptySrcDirs", "deleteEmptySrcDirs"]),
+        "delete": ("operations/delete", ["fs"]),
+        "purge": ("operations/purge", ["fs", "remote"]),
+    })
+    filter_params: set[str] = field(default_factory = lambda: {
+        "--delete-excluded", "--exclude-file", "--exclude-from", "--exclude-rule", "--files-from",
+        "--files-from-raw", "--filter-from", "--filter-rule", "--ignore-case", "--include-from",
+        "--include-rule", "--max-age", "--max-size", "--min-age", "--min-size"})
+    list_filter_params: set[str] = field(default_factory = lambda: {
+        "--exclude-file", "--exclude-from", "--exclude-rule", "--files-from", "--files-from-raw",
+        "--filter-from", "--filter-rule", "--include-from", "--include-rule"})
+    max_async_poll_interval: int = 60  # seconds
+
+
+@dataclass
 class GlobalConfig(DataClassWithFromDict):
     api_key: str
     message_listener_address: tuple[str, int]
@@ -100,6 +129,8 @@ class GlobalConfig(DataClassWithFromDict):
     max_failures_per_hour: int = 5
     max_failures_per_day: int = 20
     default_hashsum: NoHash = None
+    rclone_gui_url_pattern: str = DEFAULT_RCLONE_GUI_URL_PATTERN
+    rclone_gui: Optional[RcloneGUIConfig] = None
 
     @classmethod
     def read_from_file(cls, file: Path | str) -> Self:
@@ -168,7 +199,7 @@ class FolderConfig:
         self.archive_config: Optional[ArchiveConfig] = archive_config
         self.cloud_only_defaults: list[tuple[list[str], list[str]]] = [
             ([item], []) if isinstance(item, str) else
-             tuple(map(lambda x: [x] if isinstance(x, str) else x, item))
+             tuple(map(lambda x: [x] if isinstance(x, str) else list(x), item))
              for item in cloud_only_defaults
         ]
         self.trash_keep_time: timedelta = trash_keep_time

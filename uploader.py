@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 import data_logger
 from config import (AllFiles, FolderConfig, FolderUploaderQueue, GlobalConfig,
                     UploadAction, UploaderAction, UploaderQueue)
-from util import retry_on_error, run_command
+from util import retry_on_error, run_rclone
 
 
 class Uploader:
@@ -64,11 +64,10 @@ class Uploader:
                           len(paths), paths[0], paths[-1])
 
         with NamedTemporaryFile("w", suffix=".txt") as f:
-            files_str = "\n".join(paths)
-            f.write(files_str)
+            f.write("\n".join(paths))
             f.flush()
 
-            run_command(["rclone", action, "--files-from", f.name, local_folder,
+            run_rclone(action, ["--files-from", f.name, local_folder,
                          remote_folder], self.global_config,
                         error_message="Hiba történt a fájlok feltöltése közben.")
 
@@ -216,7 +215,7 @@ class FolderUploader:
         with NamedTemporaryFile("w", suffix=".txt") as f:
             f.write("\n".join(paths))
             f.flush()
-            run_command(["rclone", "delete", self.config.remote_folder, "--files-from", f.name],
+            run_rclone("delete", [self.config.remote_folder, "--files-from", f.name],
                         self.config.global_config,
                         error_message="Hiba történt a fájlok törlése közben.")
 
@@ -268,7 +267,7 @@ class FolderUploader:
                 data_logger.log(self.config.global_config, not_deleted_locally=result)
                 return
 
-            run_command(["rclone", "purge", self.config.remote_folder.joinpath(path)],
+            run_rclone("purge", [self.config.remote_folder.joinpath(path)],
                         self.config.global_config,
                         error_message=f"Hiba történt a '{path}' mappa törlése közben.")
 

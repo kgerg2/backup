@@ -1,10 +1,13 @@
 import logging
+import re
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from logging.handlers import TimedRotatingFileHandler
 from multiprocessing import AuthenticationError, Process, Queue
 from multiprocessing.connection import Connection, Listener
+from subprocess import Popen
 from time import sleep
 from typing import Any, Iterable, Optional
 
@@ -13,7 +16,8 @@ from dateutil.relativedelta import relativedelta
 
 from archiver import archive, update_all_files
 from change_listener import SyncthingChangeListener, SyncthingChanges
-from config import FolderConfig, GlobalConfig, FolderProperties, FolderUploaderQueue, UploaderQueue
+from config import (FolderConfig, FolderProperties, FolderUploaderQueue,
+                    GlobalConfig, RcloneGUIConfig, UploaderQueue)
 from sync import UploadSyncer, sync_from_cloud
 from trashhandler import handle_trash
 from uploader import FolderUploader, Uploader
@@ -78,7 +82,8 @@ class TimedTask:
 
 def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                     folders: list[FolderProperties], uploader_queue: UploaderQueue,
-                    processes: dict[str, dict[str, Any]]):
+                    processes: dict[str, dict[str, Any]],
+                    popen_processes: dict[str, dict[str, Any]]) -> None:
     def get_process_summary(process: Optional[Process]):
         if process is None:
             return "does not exist"
@@ -114,8 +119,32 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                 "uploader_queue_size": uploader_queue.qsize()
             })
 
+        case ["get", "rclone_gui_config", *args]:
+            if config.rclone_gui is None:
+                conn.send(None)
+            else:
+                conn.send({k: v for k, v in asdict(config.rclone_gui).items() if k in args})
+
+        case ["get", process] if process in popen_processes:
+            if (exit_code := popen_processes[process]["process"].poll()) is None:
+                conn.send(f"Process {process} is running.")
+            else:
+                conn.send(f"Process {process} has exited with code {exit_code}.")
+
         case ["get", process] if process in processes:  # pylint: disable=used-before-assignment
             conn.send(get_process_summary(processes[process].get("process", None)))
+
+        case ["start", process] if process in popen_processes:
+            if (exit_code := popen_processes[process]["process"].poll()) is None:
+                conn.send(f"Process {process} is already running.")
+            else:
+                try:
+                    popen_processes[process]["process"] = \
+                        popen_processes[process]["target"](*popen_processes[process]["args"])
+                except subprocess.SubprocessError as e:
+                    conn.send(f"Process {process} could not be started: {e}")
+                else:
+                    conn.send("OK")
 
         case ["start", process] if process in processes:
             try:
@@ -125,11 +154,30 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             else:
                 conn.send("OK")
 
+        case ["stop", process] if process in popen_processes:
+            if (exit_code := popen_processes[process]["process"].poll()) is None:
+                popen_processes[process]["process"].terminate()
+                conn.send(f"Process {process} has been terminated.")
+            else:
+                conn.send(f"Process {process} is not running.")
+
         case ["stop", process] if process in processes:
             try:
                 stop_process(processes[process])
             except ValueError as e:
                 conn.send(f"The process could not be stopped: {e}")
+            else:
+                conn.send("OK")
+
+        case ["restart", process] if process in popen_processes:
+            if popen_processes[process]["process"].poll() is None:
+                popen_processes[process]["process"].terminate()
+
+            try:
+                popen_processes[process]["process"] = \
+                    popen_processes[process]["target"](*popen_processes[process]["args"])
+            except subprocess.SubprocessError as e:
+                conn.send(f"Process {process} could not be started: {e}")
             else:
                 conn.send("OK")
 
@@ -149,7 +197,7 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
                 conn.send("OK")
 
         case ["run", "check_processes"]:
-            restarted = check_processes(processes)
+            restarted = check_processes(processes, popen_processes)
             if restarted:
                 conn.send(f"{len(restarted)} processes were restarted: {', '.join(restarted)}")
             else:
@@ -162,6 +210,7 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             task_process = Process(target=archive,
                                    args=[folder_properties, *args])
             task_process.start()
+            conn.send("OK")
 
         case ["run", "update_all_files", folder] \
                 if any(folder == config["config"].folder_id for config in folders):
@@ -171,6 +220,7 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             task_process = Process(target=update_all_files,
                                    args=[folder_config])
             task_process.start()
+            conn.send("OK")
 
         case ["run", task, *args] if task in commands:  # pylint: disable=used-before-assignment
             task = TASKS[commands[task]]
@@ -182,18 +232,25 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             task_process = Process(target=task.task,
                                    args=task.args + args)
             task_process.start()
+            conn.send("OK")
 
         case _:
             conn.send(f"Unrecognized request: {msg}")
 
 
-def check_processes(processes: dict[str, dict[str, Any]]):
+def check_processes(processes: dict[str, dict[str, Any]], popen_processes: dict[str, dict[str, Any]]):
     restarted: list[str] = []
     for name, spec in processes.items():
         if "process" not in spec or not spec["process"].is_alive():
             logging.warning("Egy folyamat nem fut, ezért újraindításra kerül: %s", name)
             restarted.append(name)
             start_process(spec)
+
+    for name, spec in popen_processes.items():
+        if spec["process"].poll() is not None:
+            logging.warning("Egy folyamat nem fut, ezért újraindításra kerül: %s", name)
+            restarted.append(name)
+            spec["process"] = spec["target"](*spec["args"])
 
     return restarted
 
@@ -344,6 +401,8 @@ def main():
 
     uploader_queue: UploaderQueue = Queue(maxsize=1000)  # type: ignore
 
+    rclone_gui_process = start_rclone_gui(global_config)
+
     processes = {
         "uploader": {
             "target": Uploader,
@@ -384,13 +443,24 @@ def main():
     timed_tasks_process = Process(target=start_main_loop, args=[processes, folders])
     timed_tasks_process.start()
 
+
+    popen_processes: dict[str, dict[str, Any]] = {
+        "rclone_gui": {
+            "process": rclone_gui_process,
+            "target": start_rclone_gui,
+            "args": [global_config]
+        }
+    }
+
     return retry_on_error(run_message_server,
-                          args=(global_config, uploader_queue, processes, folders),
+                          args=(global_config, uploader_queue, processes, folders,
+                                popen_processes),
                           error_message="Az üzenetfogadás során hiba történt.")
 
 
 def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueue,
-                       processes: dict[str, dict[str, Any]], folders: list[FolderProperties]):
+                       processes: dict[str, dict[str, Any]], folders: list[FolderProperties],
+                       popen_processes: dict[str, dict[str, Any]]) -> None:
     logging.debug("Üzenetfogadás elindul.")
 
     listener = Listener(global_config.message_listener_address,
@@ -418,10 +488,28 @@ def run_message_server(global_config: GlobalConfig, uploader_queue: UploaderQueu
                     listener.close()
                     return
 
-                process_message(msg, conn, global_config, folders, uploader_queue, processes)
+                process_message(msg, conn, global_config, folders, uploader_queue, processes,
+                                popen_processes)
         except EOFError:
             logging.warning("Hibás fogadott üzenet.")
 
+
+def start_rclone_gui(config: GlobalConfig) -> Popen[bytes]:
+    logging.debug("Rclone GUI indítása.")
+
+    p = subprocess.Popen(["rclone", "rcd", "--rc-web-gui", "--rc-web-gui-no-open-browser"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if p.stderr is None:
+        raise ValueError("Rclone GUI indítása sikertelen.")
+
+    while not (match := re.search(config.rclone_gui_url_pattern,
+                                  p.stderr.readline().decode('utf-8'))):
+        pass
+
+    config.rclone_gui = RcloneGUIConfig.from_dict(match.groupdict())
+
+    return p
 
 if __name__ == "__main__":
     main()

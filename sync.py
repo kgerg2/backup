@@ -16,7 +16,7 @@ from change_listener import SyncthingChanges
 from config import (AllFiles, FolderConfig, FolderProperties,
                     FolderUploaderQueue, UploaderAction)
 from util import (discard_ignores, get_file_details, get_remote_file_info, get_remote_mod_times,
-                  read_path_list, retry_on_error, run_command, write_checkfile)
+                  read_path_list, retry_on_error, run_rclone, write_checkfile)
 
 
 class UploadSyncer:
@@ -140,6 +140,8 @@ def filter_cloud_only_files(files: Iterable[str], config: FolderConfig) -> set[s
     :return set[str]: the filtered files
     """
 
+    files = set(files)
+
     def should_be_cloud_only(file: str, rule: str, criterions: Iterable[str]) -> bool:
         """
         Checks if a file should be cloud only based on a rule and criterions.
@@ -213,7 +215,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
         not_uploaded_files_path = dir_path.joinpath("sync.txt")
         remotely_added_files = dir_path.joinpath("deleted.txt")
 
-        run_command(["rclone", "check", checkfile, config.remote_folder,
+        run_rclone("check", [checkfile, config.remote_folder,
                      "--checkfile", "QuickXorHash",
                      "--differ", differing_files_path,
                      "--missing-on-dst", not_uploaded_files_path,
@@ -232,7 +234,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
     download_files = new_download_files.copy()
     remote_times = get_remote_mod_times(bisync_files, config)
     for file in bisync_files:
-        if remote_times[file][0] > files[file][1]:
+        if (local_mod_time := files[file][1]) is None or remote_times[file][0] > local_mod_time:
             download_files.add(file)
         else:
             upload_files.append(file)
@@ -261,7 +263,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
                 f.flush()
-                r = run_command(["rclone", "copy", config.remote_folder, config.local_folder,
+                r = run_rclone("copy", [config.remote_folder, config.local_folder,
                                  "--files-from", f.name],
                                 config.global_config,
                                 error_message="Új fájlok letöltése sikertelen.",

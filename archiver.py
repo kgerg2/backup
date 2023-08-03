@@ -17,7 +17,7 @@ from change_listener import SyncthingDbBrowseData
 from config import AllFiles, ArchiveConfig, FolderConfig, GlobalConfig, NoHash, FolderProperties
 from util import (discard_ignores, extend_ignores, get_file_details,
                   get_syncthing, is_same_file, read_path_list, run_command,
-                  write_checkfile)
+                  run_rclone, write_checkfile)
 
 
 def get_files(config: FolderConfig, return_directories: bool = True) -> \
@@ -50,7 +50,7 @@ def get_files(config: FolderConfig, return_directories: bool = True) -> \
     return files
 
 
-def validate_files(all_files: dict[str, tuple[str, datetime, int]], path: Path,
+def validate_files(all_files: dict[str, tuple[str | NoHash, datetime | None, int | None]], path: Path,
                    files: list[SyncthingDbBrowseData], added: set[str],
                    removed: set[str], changed: set[str], config: FolderConfig) -> None:
     """
@@ -109,7 +109,7 @@ def validate_files(all_files: dict[str, tuple[str, datetime, int]], path: Path,
 
 
 def update_all_files(config: FolderConfig, return_directories: bool = True) \
-        -> dict[str, tuple[str, datetime, int]]:
+        -> dict[str, tuple[str | NoHash, datetime | None, int | None]]:
     """
     Update the database with new / changed / removed files and return the current state.
 
@@ -124,7 +124,7 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
         logging.debug("SQL parancs futtatása: %s", select_stmt)
         result = session.execute(select_stmt)
         data = result.scalars().all()
-        known_files: dict[str, tuple[NoHash | str, datetime, int]] = \
+        known_files: dict[str, tuple[NoHash | str, datetime | None, int | None]] = \
             {r.path: (r.hash, r.modified, r.size) for r in data}
 
     toplevel = get_syncthing("db/browse", config.global_config,
@@ -230,7 +230,7 @@ def reconnect(archive_config: ArchiveConfig, global_config: GlobalConfig) -> Non
         logging.warning("Az archiválás nem külső eszközre történik, de mégis annak csatlakoztatása"
                         " volt kezdeményezve.")
         return
-    
+
     logging.debug("%s eszköz csatlakoztatása.", drive)
 
     r = run_command(["findmnt", drive, "-J"], global_config,
@@ -317,7 +317,7 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
         not_archived_files_path = dir_path.joinpath("sync.txt")
         deleted_files_path = dir_path.joinpath("deleted.txt")
 
-        run_command(["rclone", "check", checkfile, archive_config.archive_folder,
+        run_rclone("check", [checkfile, archive_config.archive_folder,
                      "--checkfile", "QuickXorHash",
                      "--differ", differing_files_path,
                      "--missing-on-dst", not_archived_files_path,
@@ -388,24 +388,31 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
     # Delete archived and synced files
 
     if delete_from_local:
+        delete_from_local = set(map(str, delete_from_local))
         with TemporaryDirectory() as tempdir:
             dir_path = Path(tempdir)
             missing = dir_path.joinpath("missing.txt")
+            to_delete = dir_path.joinpath("to_delete.txt")
             try:
-                run_command(["rclone", "check", config.local_folder, config.remote_folder,
-                            "--missing-on-dst", missing], config.global_config,
+                with open(to_delete, "w", encoding="utf-8") as f:
+                    f.write("\n".join(delete_from_local))
+                    f.flush()
+
+                run_rclone("check", [config.local_folder, config.remote_folder,
+                            "--missing-on-dst", missing, "--files-from", to_delete],
+                            config.global_config,
                             error_message="A törlendő lokális fájlok szinkronizáltságának "
                             "ellenőrzése sikertelen, a fájlok törlése kihagyára kerül.",
                             expected_returncodes=(1,))
 
-                files = read_path_list(missing)
+                files = set(read_path_list(missing))
 
                 if files:
                     logging.warning("Néhány fájl még nem került szinkronizálásra. "
                                     "Ezek törlése nem fog megtörténni.")
                     data_logger.log(config.global_config, files)
 
-                    delete_from_local = set(map(str, delete_from_local)) - set(files)
+                    delete_from_local -= set(files)
             except (CalledProcessError, OSError, FileNotFoundError) as e:
                 logging.warning("A %s hiba miatt a fájlok törlése nem fog megtörténni.",
                                 e.__class__)
@@ -421,7 +428,7 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(map(str, delete_from_local)))
                 f.flush()
-                run_command(["rclone", "move", "--files-from", f.name, config.local_folder,
+                run_rclone("move", ["--files-from", f.name, config.local_folder,
                              archive_config.archive_folder], config.global_config,
                             error_message="A fájlok archívumba történő áthelyezése során hiba "
                             "történt.", strict=False)
@@ -432,7 +439,7 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
         with NamedTemporaryFile(mode="w") as f:
             f.write("\n".join(delete_from_archive))
             f.flush()
-            run_command(["rclone", "move", "--files-from", f.name, archive_config.archive_folder,
+            run_rclone("move", ["--files-from", f.name, archive_config.archive_folder,
                          config.trash_folder], config.global_config,
                         error_message="Hiba történt a törölt fájlok archívumból kukába helyezése "
                         "közben.", strict=False)
