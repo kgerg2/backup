@@ -123,7 +123,8 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             if config.rclone_gui is None:
                 conn.send(None)
             else:
-                conn.send({k: v for k, v in asdict(config.rclone_gui).items() if k in args})
+                conn.send({k: v for k, v in asdict(config.rclone_gui).items()
+                           if args and k in args})
 
         case ["get", process] if process in popen_processes:
             if (exit_code := popen_processes[process]["process"].poll()) is None:
@@ -323,6 +324,7 @@ def start_main_loop(processes: dict[str, dict[str, Any]],
             logging.error("A(z) %s feladat futtatása során az újrapróbálkozások száma "
                           "meghaladta a megadott értéket ezért deaktiválásra került.", task.name)
             task.enabled = False
+            task.next_time = datetime.max
 
         if not task.enabled:
             logging.warning("A(z) %s feladat deaktiválva van ezért nem kerül futtatásra.",
@@ -387,7 +389,7 @@ def stop_process(spec):
 
 
 def main():
-    global_config = GlobalConfig.read_from_file("test-configs/global_config.json")
+    global_config = GlobalConfig.read_from_file("configs/global_config.json")
 
     global_config.logging_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(

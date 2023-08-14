@@ -178,13 +178,14 @@ def filter_cloud_only_files(files: Iterable[str], config: FolderConfig) -> set[s
                 for file in files
                 if should_be_cloud_only(file, target, criterions)}
 
-    remote_info = get_remote_file_info(filtered, config)
+    if filtered:
+        remote_info = get_remote_file_info(filtered, config)
 
-    with Session(config.database) as session:
-        session.add_all(
-            AllFiles(path=file, size=s, hash=h, modified=t, uploaded=t, cloud_only=True)
-            for file, (h, t, s) in remote_info.items())
-        session.commit()
+        with Session(config.database) as session:
+            session.add_all(
+                AllFiles(path=file, size=s, hash=h, modified=t, uploaded=t, cloud_only=True)
+                for file, (h, t, s) in remote_info.items())
+            session.commit()
 
     return files - filtered
 
@@ -239,12 +240,16 @@ def sync_from_cloud(folder_properties: FolderProperties):
         else:
             upload_files.append(file)
 
+    data_logger.log(config.global_config, download_files=download_files, upload_files=upload_files,
+                    bisync_files=bisync_files)
+
     if download_files:
         try:
             with Session(config.database) as session:
                 select_stmt = select(AllFiles.path).where(AllFiles.uploaded.is_not(None)
                                                           & AllFiles.path.in_(download_files)
-                                                          & AllFiles.size.is_(None))
+                                                          & AllFiles.size.is_(None)
+                                                          & (not AllFiles.cloud_only))
                 logging.debug("SQL parancs futtatása: %s", select_stmt)
                 deletion_missed = set(session.scalars(select_stmt))
 

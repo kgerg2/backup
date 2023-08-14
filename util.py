@@ -222,30 +222,37 @@ def extend_file_info(file: Path | str, data: dict[str, tuple[str, datetime, int]
 
 
 def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, datetime, int]:
-    if config.local_folder.joinpath(path).is_dir():
-        hashsum = config.global_config.default_hashsum
-    else:
-        r = run_rclone("hashsum", ["quickxor", config.local_folder.joinpath(path)],
-                       config.global_config,
-                       run_async=False,
-                       error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
-                       strict=False)
-        if r.returncode:
-            hashsum = config.global_config.default_hashsum
-        else:
-            output = json.loads(r.stdout.decode())
-
-            if "error" in output and output["error"]:
-                logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
-                hashsum = config.global_config.default_hashsum
-            else:
-                try:
-                    hashsum = output["result"].split()[0]
-                except IndexError:
-                    logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
-                    hashsum = config.global_config.default_hashsum
-
     stat = config.local_folder.joinpath(path).stat()
+    time = datetime.fromtimestamp(stat.st_mtime)
+    size = stat.st_size
+
+    if config.local_folder.joinpath(path).is_dir():
+        return config.global_config.default_hashsum, time, size
+
+    r = run_rclone("hashsum", ["quickxor", config.local_folder.joinpath(path)],
+                    config.global_config,
+                    run_async=False,
+                    error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
+                    strict=False)
+    if r.returncode:
+        return config.global_config.default_hashsum, time, size
+
+    try:
+        output = json.loads(r.stdout)
+
+        if "error" in output and output["error"]:
+            logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
+            return config.global_config.default_hashsum, time, size
+
+        result = output["result"]
+    except (json.JSONDecodeError, KeyError):
+        result = r.stdout.decode()
+
+    try:
+        hashsum = result.split()[0]
+    except IndexError:
+        logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
+        hashsum = config.global_config.default_hashsum
 
     return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
 
@@ -329,12 +336,17 @@ def get_remote_file_info(paths: Iterable[Path | str], config: FolderConfig) \
                          f.name], config.global_config, run_async=False,
                         error_message="Nem sikerült a fájlok hashjének meghatározása.")
 
-    output = json.loads(r.stdout.decode())
+    try:
+        output = json.loads(r.stdout)
 
-    if "error" in output and output["error"]:
-        logging.error("Nem sikerült a fájlok hashjének meghatározása: %s", output)
+        if "error" in output and output["error"]:
+            logging.error("Nem sikerült a fájlok hashjének meghatározása: %s", output)
 
-    hashsums = {line[42:]: line[:40] for line in output["result"].splitlines()}
+        hashsum_result = output["result"].splitlines()
+    except (json.JSONDecodeError, KeyError):
+        hashsum_result = r.stdout.decode().splitlines()
+
+    hashsums = {line[42:]: line[:40] for line in hashsum_result}
     result = {file: (hashsums.get(file, config.global_config.default_hashsum), date, size)
               for file, (date, size) in result.items()}
 
@@ -361,14 +373,19 @@ def get_remote_mod_times(paths: Iterable[Path | str],
         date = (date + "0"*6)[:26]
         return file, datetime.strptime(date, "%Y-%m-%d %H:%M:%S.%f"), int(size)
 
-    output = json.loads(r.stdout.decode())
+    try:
+        output = json.loads(r.stdout)
 
-    if "error" in output and output["error"]:
-        logging.error("A távoli fájlok módosítási idejeinek lekérése sikertelen: %s", output)
-        raise ValueError("Cannot get modification time. " + output)
+        if "error" in output and output["error"]:
+            logging.error("A távoli fájlok módosítási idejeinek lekérése sikertelen: %s", output)
+            raise ValueError("Cannot get modification time. " + output)
+
+        result = output["result"].splitlines()
+    except (json.JSONDecodeError, KeyError):
+        result = r.stdout.decode().splitlines()
 
     return {file: (date, size) for file, date, size
-            in map(get_tuple, output["result"].splitlines())}
+            in map(get_tuple, result)}
 
 
 def request_syncthing(method: Callable[..., requests.Response], req: str, config: GlobalConfig,

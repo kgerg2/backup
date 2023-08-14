@@ -131,7 +131,7 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
                              {"folder": config.folder_id, "levels": 0})
 
     added: set[str] = set()
-    removed: set[str] = set(known_files.keys())
+    removed: set[str] = {r.path for r in data if not r.cloud_only}
     changed: set[str] = set()
 
     for tl in toplevel:
@@ -160,7 +160,8 @@ def update_all_files(config: FolderConfig, return_directories: bool = True) \
 
         if isinstance(resp, str) and "No such object in the index" in resp \
                 or (isinstance(resp, dict)
-                    and (resp["global"]["deleted"] or resp["global"]["ignored"])):
+                    and (resp["global"]["deleted"] or resp["global"]["ignored"]
+                         or resp["global"]["invalid"])):
 
             del known_files[file]
             paths_to_delete.append(file)
@@ -355,6 +356,11 @@ def sync_with_archive(config: FolderConfig, freeup_needed: int = 0):
 
         delete_from_local, freed_up_spaces = list(t[0]), t[1]
         freed_up_space = sum(freed_up_spaces)
+
+    if not isinstance(freeup_needed, int):
+        logging.warning("A kért felszabadítandó tárhely mérete nem egész szám (%s).",
+                        freeup_needed)
+        freeup_needed = 0
 
     if freeup_needed < 0:
         logging.warning("A kért felszabadítandó tárhely mérete negatív (%d).", freeup_needed)
