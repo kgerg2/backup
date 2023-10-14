@@ -177,6 +177,7 @@ class FolderUploader:
         filtered_files = [file for file in collect_files if self.check_file(file)]
         self.uploader_queue.put((filtered_files, action, self.config.local_folder,
                                  self.config.remote_folder))
+        data_logger.log(self.config.global_config, upload_files=filtered_files)
 
         with Session(self.config.database) as session:
             update_stmt = update(AllFiles) \

@@ -240,9 +240,6 @@ def sync_from_cloud(folder_properties: FolderProperties):
         else:
             upload_files.append(file)
 
-    data_logger.log(config.global_config, download_files=download_files, upload_files=upload_files,
-                    bisync_files=bisync_files)
-
     if download_files:
         try:
             with Session(config.database) as session:
@@ -265,6 +262,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
                 data_logger.log(config.global_config, deletion_missed)
                 uploader_queue.put((deletion_missed, "delete_files"))
 
+            data_logger.log(config.global_config, download_files=download_files)
             with NamedTemporaryFile(mode="w") as f:
                 f.write("\n".join(download_files))
                 f.flush()
@@ -287,9 +285,6 @@ def sync_from_cloud(folder_properties: FolderProperties):
         except (FileNotFoundError, OSError):
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s",
                           traceback.format_exc())
-
-    data_logger.log(config.global_config, bisync_files=bisync_files, upload_files=upload_files,
-                    download_files=download_files)
 
     if upload_files:
         discard_ignores(upload_files, config)
