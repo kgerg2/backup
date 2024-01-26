@@ -223,6 +223,24 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             task_process.start()
             conn.send("OK")
 
+        case ["run", "download_only", folder] \
+                if any(folder == config["config"].folder_id for config in folders):
+            folder_properties = next(config for config in folders
+                                     if folder == config["config"].folder_id)
+            task_process = Process(target=sync_from_cloud,
+                                      args=[folder_properties], kwargs={"skip_upload": True})
+            task_process.start()
+            conn.send("OK")
+
+        case ["run", "upload_only", folder] \
+                if any(folder == config["config"].folder_id for config in folders):
+            folder_properties = next(config for config in folders
+                                     if folder == config["config"].folder_id)
+            task_process = Process(target=sync_from_cloud,
+                                      args=[folder_properties], kwargs={"skip_download": True})
+            task_process.start()
+            conn.send("OK")
+
         case ["run", task, *args] if task in commands:  # pylint: disable=used-before-assignment
             task = TASKS[commands[task]]
             if task.task is check_processes:

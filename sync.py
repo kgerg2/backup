@@ -190,7 +190,8 @@ def filter_cloud_only_files(files: Iterable[str], config: FolderConfig) -> set[s
     return files - filtered
 
 
-def sync_from_cloud(folder_properties: FolderProperties):
+def sync_from_cloud(folder_properties: FolderProperties, skip_upload: bool = False,
+                    skip_download: bool = False) -> None:
     """
     Function responsible for making sure the the remote folder is in sync with the Syncthing global
     database by downloading, uploading and deleting the necessary files.
@@ -240,7 +241,7 @@ def sync_from_cloud(folder_properties: FolderProperties):
         else:
             upload_files.append(file)
 
-    if download_files:
+    if download_files and not skip_download:
         try:
             with Session(config.database) as session:
                 select_stmt = select(AllFiles.path).where(AllFiles.uploaded.is_not(None)
@@ -286,6 +287,6 @@ def sync_from_cloud(folder_properties: FolderProperties):
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s",
                           traceback.format_exc())
 
-    if upload_files:
+    if upload_files and not skip_upload:
         discard_ignores(upload_files, config)
         uploader_queue.put((upload_files, "copy"))
