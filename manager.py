@@ -101,6 +101,40 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
     }
 
     match msg:
+        case ["help"]:
+            conn.send({
+                "commands": {
+                    "get": {
+                        "config": "Get the global config.",
+                        "folders": "Get the folder configs.",
+                        "uploader": "Get the uploader process.",
+                        "rclone_gui_config [*args]": "Get the rclone GUI config. May be filtered by the given arguments.",
+                        "process": "Get the status of a process.",
+                    },
+                    "start": {
+                        "process": "Start a process.",
+                    },
+                    "stop": {
+                        "process": "Stop a process.",
+                    },
+                    "restart": {
+                        "process": "Restart a process.",
+                    },
+                    "run": {
+                        "check_processes": "Check if all processes are running.",
+                        "archive <folder_id> [freeup_needed (bytes)]": "Run the archive task.",
+                        "download_only": "Sync from cloud without uploading.",
+                        "upload_only": "Sync to cloud without downloading.",
+                        "update_all_files <folder_id>": "Update the database of all files.",
+                    }
+                },
+                "processes": {
+                    "uploader": "The uploader process.",
+                    "change_listener": "The change listener process.",
+                    "rclone_gui": "The rclone GUI process.",
+                },
+            })
+
         case ["get", "config"]:
             conn.send(asdict(config))
 
@@ -123,8 +157,11 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             if config.rclone_gui is None:
                 conn.send(None)
             else:
-                conn.send({k: v for k, v in asdict(config.rclone_gui).items()
-                           if args and k in args})
+                if not args:
+                    conn.send(asdict(config.rclone_gui))
+                else:
+                    conn.send({k: v for k, v in asdict(config.rclone_gui).items()
+                               if args and k in args})
 
         case ["get", process] if process in popen_processes:
             if (exit_code := popen_processes[process]["process"].poll()) is None:
@@ -254,7 +291,7 @@ def process_message(msg: Any, conn: Connection, config: GlobalConfig,
             conn.send("OK")
 
         case _:
-            conn.send(f"Unrecognized request: {msg}")
+            conn.send(f"Unrecognized request: {msg}\nUse 'help' to get a list of commands.")
 
 
 def check_processes(processes: dict[str, dict[str, Any]], popen_processes: dict[str, dict[str, Any]]):
