@@ -13,19 +13,6 @@ from sqlalchemy import ColumnElement, Engine, create_engine, or_
 from sqlalchemy.ext.hybrid import hybrid_method
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# from change_listener import SyncthingChanges  # pylint: disable=unused-import
-# MOUNT_FOLDER = "/media/kgerg/TOSHIBA EXT"
-# CONFIG_DATA = METADATA_FOLDER.joinpath("config.json")
-# LOGGING_FILE = Path("~/Shared/Syncthing-dev/logs.txt").expanduser()
-
-# API_KEY = "KaK7CFasJCLAoSCsHtZjvEoC7LZwAvqi"
-# FOLDER_ID = "pfkxq-prxga"
-
-
-# MESSAGE_LISTENER_ADDRESS = ("localhost", 6102)
-# MESSAGE_LISTENER_AUTH_TOKEN = b"7iaJmp6vFgwzHb02KCMqEa77xqQaYRx3"
-
-# DEFAULT_HASHSUM = None
 
 UploadAction = Literal["copy", "move"]
 UploaderQueue = NewType("UploaderQueue",
@@ -54,9 +41,22 @@ NoHash: TypeAlias = Any
 
 @dataclass
 class DataClassWithFromDict:
+    """
+    Dataclass with a from_dict method.
+    """
+
     T = TypeVar("T")
     @classmethod
     def convert_type(cls, value: Any, target_type: Type[T]) -> T:
+        """
+        Converts a value to a given type.
+
+        :param Any value: The value to convert.
+        :param Type[T] target_type: The type to convert to.
+        :raises ValueError: If the value cannot be converted to the given type.
+        :return T: The converted value.
+        """
+
         if get_origin(target_type) == Union:
             union_args = get_args(target_type)
 
@@ -65,9 +65,9 @@ class DataClassWithFromDict:
 
             union_args = filter(lambda x: x != NoneType, union_args)
 
-            for type in union_args:
+            for t in union_args:
                 try:
-                    return cls.convert_type(value, type)
+                    return cls.convert_type(value, t)
                 except TypeError:
                     continue
 
@@ -80,7 +80,15 @@ class DataClassWithFromDict:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Self:
-        typed_config = {key: cls.convert_type(value, field.type) for key, value in d.items() for field in fields(cls) if field.name == key}
+        """
+        Creates an instance of the class from a dictionary.
+        
+        :param dict[str, Any] d: The dictionary to create the instance from.
+        :return Self: The created instance.
+        """
+
+        typed_config = {key: cls.convert_type(value, field.type) for key, value in d.items()
+                        for field in fields(cls) if field.name == key}
         return cls(**typed_config)
 
 
@@ -113,6 +121,10 @@ class RcloneGUIConfig(DataClassWithFromDict):
 
 @dataclass
 class GlobalConfig(DataClassWithFromDict):
+    """
+    Global configuration.
+    """
+
     api_key: str
     message_listener_address: tuple[str, int]
     message_listener_auth_token: bytes
@@ -235,7 +247,7 @@ class FolderConfig:
         }
 
     @classmethod
-    def read_from_file(cls, file: Path | str, global_config: GlobalConfig) -> Self:
+    def read_from_file(cls, file: Path | str, global_config: GlobalConfig) -> "FolderConfig":
         """
         Reads the configuration from a file.
 
@@ -304,7 +316,7 @@ class AllFiles(Base):
         return self.path.startswith(path)
 
     @hybrid_method
-    def is_relative_to_any(self, paths: Iterable[str]) -> bool:
+    def is_relative_to_any(self, paths: Iterable[str]) -> bool:  # type: ignore
         """
         Hybrid method for deciding whether a path in the database is relative to amy of the given
         ones.
@@ -315,8 +327,9 @@ class AllFiles(Base):
         return any(self.path.startswith(path) for path in paths)
 
     @is_relative_to_any.expression
-    def is_relative_to_any(cls, paths: Iterable[str]) -> ColumnElement[bool]:
-        return or_(*[cls.path.startswith(path) for path in paths])
+    def is_relative_to_any(cls, paths: Iterable[str]) -> ColumnElement[bool]:  # pylint: disable=no-self-argument
+        """SQL expression for is_relative_to_any."""
+        return or_(*[cls.path.startswith(path) for path in paths])  # type: ignore
 
 
 # class SyncEvents(Base):
@@ -335,6 +348,6 @@ FolderProperties = TypedDict("FolderProperties", {
     "config": FolderConfig,
     "uploader_queue": FolderUploaderQueue,
     "uploader_process": Process,
-    "folder_changes_queue": "Queue[SyncthingChanges]",
+    "folder_changes_queue": "Queue[SyncthingChanges]",  # type: ignore
     "upload_syncer_process": Process
 })
