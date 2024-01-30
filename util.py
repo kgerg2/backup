@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import sleep, time
-from typing import Any, Optional, TypeVar
+from typing import Any, Literal, Optional, TypeVar, overload
 
 import requests
 from sqlalchemy import Engine, select
@@ -88,10 +88,23 @@ def run_command(command: list[Any], config: GlobalConfig, error_message: str = "
     return r
 
 
+@overload
+def run_rclone(command: str, args: list[Any], config: GlobalConfig, method: str = "core/command",
+               run_async: Literal[False] = False, use_web_ui: bool = True, **kwargs
+               ) -> subprocess.CompletedProcess[bytes]:
+    ...
+
+
+@overload
+def run_rclone(command: str, args: list[Any], config: GlobalConfig, method: str = "core/command",
+               run_async: Literal[True] = True, use_web_ui: bool = True, **kwargs
+               ) -> dict[str, Any] | subprocess.CompletedProcess[bytes]:
+    ...
+
 
 def run_rclone(command: str, args: list[Any], config: GlobalConfig, method: str = "core/command",
                run_async: bool = True, use_web_ui: bool = True, **kwargs
-               ) -> subprocess.CompletedProcess[bytes]:
+               ) -> subprocess.CompletedProcess[bytes] | dict[str, Any]:
     rclone_config = config.rclone_gui
 
     if not rclone_config or not use_web_ui:
@@ -146,10 +159,24 @@ def run_rclone(command: str, args: list[Any], config: GlobalConfig, method: str 
         config
     )
 
-def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool, config: GlobalConfig) -> Any:
+
+@overload
+def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: Literal[False],
+                    config: GlobalConfig) -> subprocess.CompletedProcess[bytes]:
+    ...
+
+
+@overload
+def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool,
+                    config: GlobalConfig) -> dict[str, Any] | subprocess.CompletedProcess[bytes]:
+    ...
+
+
+def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool,
+                    config: GlobalConfig) -> dict[str, Any] | subprocess.CompletedProcess[bytes]:
     if not runs_async:
         return res
-    
+
     rclone_config = config.rclone_gui
 
     if not rclone_config:
@@ -167,7 +194,7 @@ def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool, c
     if "jobid" not in output:
         logging.error("A rclone parancs aszinkron elindítása meghiúsult (nincs 'jobid' mező)")
         return res
-    
+
     jobid = output["jobid"]
 
     wait_time = 1
@@ -186,6 +213,7 @@ def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool, c
         logging.error("Az rclone parancs futása meghiúsult (%s).", output)
 
     return output
+
 
 def get_file_info(file: Path | str, config: FolderConfig) -> \
         dict[str, tuple[Optional[str], datetime, int]]:
@@ -226,26 +254,26 @@ def extend_file_info(file: Path | str, data: dict[str, tuple[str, datetime, int]
 
 def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, datetime, int]:
     stat = config.local_folder.joinpath(path).stat()
-    time = datetime.fromtimestamp(stat.st_mtime)
+    modtime = datetime.fromtimestamp(stat.st_mtime)
     size = stat.st_size
 
     if config.local_folder.joinpath(path).is_dir():
-        return config.global_config.default_hashsum, time, size
+        return config.global_config.default_hashsum, modtime, size
 
     r = run_rclone("hashsum", ["quickxor", config.local_folder.joinpath(path)],
-                    config.global_config,
-                    run_async=False,
-                    error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
-                    strict=False)
+                   config.global_config,
+                   run_async=False,
+                   error_message=f"Nem sikerült a fájl ({path}) hashjének meghatározása.",
+                   strict=False)
     if r.returncode:
-        return config.global_config.default_hashsum, time, size
+        return config.global_config.default_hashsum, modtime, size
 
     try:
         output = json.loads(r.stdout)
 
         if "error" in output and output["error"]:
             logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
-            return config.global_config.default_hashsum, time, size
+            return config.global_config.default_hashsum, modtime, size
 
         result = output["result"]
     except (json.JSONDecodeError, KeyError):
@@ -257,7 +285,7 @@ def get_file_details(path: Path, config: FolderConfig) -> tuple[NoHash | str, da
         logging.warning("Egy fájlnak nem sikerült a hash-jéjt meghatározni: '%s'", path)
         hashsum = config.global_config.default_hashsum
 
-    return (hashsum, datetime.fromtimestamp(stat.st_mtime), stat.st_size)
+    return (hashsum, modtime, stat.st_size)
 
 
 def delete_from_file_info(file: Path | str, data: dict[str, tuple[str, datetime, int]],
@@ -281,7 +309,7 @@ def is_same_file(file1: tuple[str | NoHash, datetime | None, int | None]
             logging.warning("Két fájl azonos hash-sel de eltérő mérettel rendelkezett. "
                             "(%s, %s != %s)", hash1, size1, size2)
             return False
-        
+
         if date1 is None or date2 is None:
             return date1 == date2
 
@@ -299,7 +327,7 @@ def is_same_file(file1: tuple[str | NoHash, datetime | None, int | None]
 
     if size1 != size2:
         return False
-    
+
     if date1 is None or date2 is None:
         return date1 == date2
 
@@ -336,8 +364,8 @@ def get_remote_file_info(paths: Iterable[Path | str], config: FolderConfig) \
         f.writelines(f"{path}\n" for path in paths)
         f.flush()
         r = run_rclone("hashsum", ["quickxor", config.remote_folder, "--files-from",
-                         f.name], config.global_config, run_async=False,
-                        error_message="Nem sikerült a fájlok hashjének meghatározása.")
+                                   f.name], config.global_config, run_async=False,
+                       error_message="Nem sikerült a fájlok hashjének meghatározása.")
 
     try:
         output = json.loads(r.stdout)
@@ -362,9 +390,9 @@ def get_remote_mod_times(paths: Iterable[Path | str],
         f.writelines(f"{path}\n" for path in paths)
         f.flush()
         r = run_rclone("lsl", [config.remote_folder, "--files-from", f.name],
-                        config.global_config, run_async=False,
-                        error_message="Távoli fájlok módosítási idejeinek lekérése sikertelen.",
-                        strict=False)
+                       config.global_config, run_async=False,
+                       error_message="Távoli fájlok módosítási idejeinek lekérése sikertelen.",
+                       strict=False)
 
     def get_tuple(line):
         match = re.fullmatch(r" *(\d+) (\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d\.\d+) (.*)", line)
