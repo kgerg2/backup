@@ -273,7 +273,7 @@ def sync_from_cloud(folder_properties: FolderProperties, skip_upload: bool = Fal
                                 error_message="Új fájlok letöltése sikertelen.",
                                 strict=False)
 
-            if r.returncode == 0:
+            if isinstance(r, dict) and r["error"] == "":
                 with Session(config.database) as session:
                     update_stmt = update(AllFiles) \
                         .where(AllFiles.path.in_(tuple(download_files)) &
@@ -282,6 +282,8 @@ def sync_from_cloud(folder_properties: FolderProperties, skip_upload: bool = Fal
                     logging.debug("SQL parancs futtatása: %s", update_stmt)
                     session.execute(update_stmt)
                     session.commit()
+            else:
+                logging.warning("Új fájlok letöltése sikertelen. Rclone hibaüzenet: %s", r)
 
         except (FileNotFoundError, OSError):
             logging.error("Hiba történt a felhőben történt módosítások letöltése közben: %s",

@@ -182,7 +182,10 @@ def wait_for_rclone(res: subprocess.CompletedProcess[bytes], runs_async: bool, c
         if output["finished"] or output["error"] == "job not found":
             break
 
-    return output["output"]
+    if output["error"] != "":
+        logging.error("Az rclone parancs futása meghiúsult (%s).", output)
+
+    return output
 
 def get_file_info(file: Path | str, config: FolderConfig) -> \
         dict[str, tuple[Optional[str], datetime, int]]:
