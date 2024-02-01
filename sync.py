@@ -96,7 +96,10 @@ class UploadSyncer:
                     file_objs = session.execute(select_stmt)
                     for file in file_objs:
                         path = file.AllFiles.path
-                        actions["copy"].remove(path)
+                        try:
+                            actions["copy"].remove(path)
+                        except ValueError:
+                            logging.warning("A %s fájl kétszer szerepelt az adatbázisban.", path)
                         file.AllFiles.hash, file.AllFiles.modified, file.AllFiles.size = \
                             get_file_details(Path(path), self.config)
                     session.commit()
